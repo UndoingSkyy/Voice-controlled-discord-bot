@@ -20,6 +20,12 @@ Discord voice
 Resampling is plain integer math in [src/audio.js](src/audio.js) — both ratios are
 whole numbers (3:1 and 1:2), so there's no ffmpeg dependency.
 
+## Prerequisites
+
+- **Node:** tested on Node 24. Run `node -v` to verify. On Windows, installing
+  the Visual Studio Build Tools is recommended if you want a native `@discordjs/opus`.
+- **A Discord application and a Gemini API key:** see Setup below.
+
 ## Setup
 
 **1. Discord application** — at https://discord.com/developers/applications:
@@ -36,6 +42,20 @@ cp .env.example .env
 ```
 
 Fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, and `GEMINI_API_KEY`.
+
+Quick start (copy & paste)
+
+```bash
+# Unix / macOS
+cp .env.example .env
+
+# PowerShell (Windows)
+Copy-Item .env.example .env
+
+npm install
+npm run deploy -- YOUR_GUILD_ID
+npm start
+```
 
 **4. Install and register the slash commands.** Pass your server (guild) ID to
 register instantly — global registration can take up to an hour to appear:
