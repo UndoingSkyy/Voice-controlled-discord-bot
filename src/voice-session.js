@@ -12,9 +12,30 @@ import prism from 'prism-media';
 
 import { GeminiLiveSession } from './gemini-live.js';
 import { SpeakerStream, pcm48StereoTo16Mono, pcm24MonoTo48Stereo } from './audio.js';
+import { moderationDeclarations, executeTool, autoMute } from './moderation-tools.js';
+import { ProfanityGuard } from './profanity-guard.js';
 
 /** How long a user must be quiet before we treat their turn as finished. */
 const SILENCE_MS = 500;
+
+/** Ignore an attributed speaker older than this when a tool call arrives. */
+const SPEAKER_TTL_MS = 30_000;
+
+const MODERATION_INSTRUCTION = `
+You can moderate this Discord server with the provided tools.
+
+Rules you must follow:
+- Before disconnecting, timing out, or deleting messages, say what you are about
+  to do and wait for the person to confirm. These cannot be undone.
+- Speech recognition mishears names. If a name is unclear or could match several
+  people, call list_members and ask which person is meant. Never guess.
+- If a tool returns an error, read the reason out loud plainly. Do not retry it
+  and do not look for another way around it.
+- Only act when someone actually asks you to. Never moderate someone because of
+  something you heard in conversation.
+`.trim();
+
+const PROFANITY_ENABLED = process.env.PROFANITY_FILTER === '1';
 
 const sessions = new Map(); // guildId -> VoiceSession
 
@@ -47,6 +68,9 @@ export async function stopSession(guildId) {
 class VoiceSession {
   #speakers = new Set(); // user ids currently streaming into Gemini
   #transcript = { user: '', model: '' };
+  #lastSpeaker = null; // { id, at } — who a tool call is attributed to
+  #turnSpeakers = new Set(); // everyone who spoke during the current turn
+  #guard = PROFANITY_ENABLED ? new ProfanityGuard() : null;
 
   constructor(voiceChannel, textChannel) {
     this.voiceChannel = voiceChannel;
@@ -106,7 +130,10 @@ class VoiceSession {
     );
     this.connection.subscribe(this.player);
 
-    this.gemini = new GeminiLiveSession();
+    this.gemini = new GeminiLiveSession({
+      functionDeclarations: moderationDeclarations,
+      extraInstruction: MODERATION_INSTRUCTION,
+    });
     this.#wireGemini();
     try {
       await this.gemini.connect();
@@ -142,6 +169,11 @@ class VoiceSession {
     this.gemini.on('turnComplete', () => {
       const { user, model } = this.#transcript;
       this.#transcript = { user: '', model: '' };
+
+      const spokeThisTurn = [...this.#turnSpeakers];
+      this.#turnSpeakers.clear();
+      if (this.#guard && user.trim()) this.#checkLanguage(user, spokeThisTurn);
+
       if (!this.textChannel) return;
       const lines = [];
       if (user.trim()) lines.push(`🗣️ **You:** ${user.trim()}`);
@@ -150,6 +182,8 @@ class VoiceSession {
         this.textChannel.send(lines.join('\n').slice(0, 1900)).catch(() => {});
       }
     });
+
+    this.gemini.on('toolCall', (calls) => this.#runTools(calls));
 
     this.gemini.on('error', (err) => console.error('[gemini]', err));
 
@@ -162,7 +196,114 @@ class VoiceSession {
     });
   }
 
+  /**
+   * Everyone shares one Gemini session, so the model can't tell us who asked.
+   * We attribute a tool call to whoever most recently spoke, and refuse to act
+   * if that attribution is stale — better a refusal than moderating on behalf
+   * of the wrong person.
+   */
+  async #requester() {
+    const last = this.#lastSpeaker;
+    if (!last || Date.now() - last.at > SPEAKER_TTL_MS) return null;
+
+    const cached = this.voiceChannel.members.get(last.id);
+    if (cached) return cached;
+    try {
+      return await this.voiceChannel.guild.members.fetch(last.id);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Escalating profanity enforcement. Nobody reviews an automatic punishment,
+   * so this only fires when exactly one person spoke during the turn — with
+   * overlapping voices the transcript cannot be safely attributed, and muting
+   * the wrong person is worse than missing one.
+   */
+  async #checkLanguage(transcript, spokeThisTurn) {
+    if (spokeThisTurn.length !== 1) {
+      const hits = this.#guard.findHits(transcript);
+      if (hits.length) {
+        console.log(`[guard] skipped — ${spokeThisTurn.length} speakers overlapped, can't attribute`);
+      }
+      return;
+    }
+
+    const member = this.voiceChannel.members.get(spokeThisTurn[0]);
+    if (!member) return;
+
+    const verdict = this.#guard.evaluate(member.id, transcript);
+    if (!verdict) return;
+
+    console.log(`[guard] ${member.user.tag} strike ${verdict.count} -> ${verdict.action}`);
+
+    if (verdict.action === 'warn') {
+      this.gemini.sendText(
+        `[automated notice] ${member.displayName} used inappropriate language. ` +
+          'Warn them briefly and firmly that repeating it will get them muted. Do not repeat the word.',
+      );
+      this.textChannel
+        ?.send(`⚠️ **${member.displayName}** warned for language (strike 1).`)
+        .catch(() => {});
+      return;
+    }
+
+    const minutes = Math.round(this.#guard.muteMs / 60_000);
+    try {
+      const { dryRun } = await autoMute(
+        member,
+        this.#guard.muteMs,
+        `Repeated inappropriate language (strike ${verdict.count})`,
+      );
+      this.gemini.sendText(
+        `[automated notice] ${member.displayName} was warned already and did it again, ` +
+          `so they have been muted for ${minutes} minutes. Say so briefly. Do not repeat the word.`,
+      );
+      this.textChannel
+        ?.send(
+          `🔇 **${member.displayName}** muted for ${minutes} min — strike ${verdict.count}.` +
+            (dryRun ? ' *(dry run — not actually muted)*' : ''),
+        )
+        .catch(() => {});
+    } catch (err) {
+      console.warn(`[guard] could not mute ${member.user.tag}: ${err.message}`);
+      this.textChannel
+        ?.send(`⚠️ Wanted to mute **${member.displayName}** but couldn't: ${err.message}`)
+        .catch(() => {});
+    }
+  }
+
+  async #runTools(calls) {
+    const requester = await this.#requester();
+    const ctx = {
+      guild: this.voiceChannel.guild,
+      voiceChannel: this.voiceChannel,
+      textChannel: this.textChannel,
+      requester,
+      presenceEnabled: process.env.ENABLE_PRESENCE === '1',
+    };
+
+    const responses = [];
+    for (const call of calls) {
+      const response = await executeTool(call.name, call.args, ctx);
+      responses.push({ id: call.id, name: call.name, response });
+
+      // Leave a written trail: voice moderation is otherwise invisible.
+      if (this.textChannel && call.name !== 'list_members') {
+        const who = requester?.displayName ?? 'unknown speaker';
+        const line = response.error
+          ? `🚫 **${who}** → \`${call.name}\` refused: ${response.error}`
+          : `🛡️ **${who}** → ${response.done}`;
+        this.textChannel.send(line.slice(0, 1900)).catch(() => {});
+      }
+    }
+
+    this.gemini.sendToolResponse(responses);
+  }
+
   #listenTo(userId) {
+    this.#lastSpeaker = { id: userId, at: Date.now() };
     if (this.#speakers.has(userId)) return; // already piping this user
     this.#speakers.add(userId);
 
@@ -178,7 +319,12 @@ class VoiceSession {
 
     const pcm = opus.pipe(decoder);
 
-    pcm.on('data', (chunk) => this.gemini?.sendAudio(pcm48StereoTo16Mono(chunk)));
+    pcm.on('data', (chunk) => {
+      // Keep attribution fresh through a long uninterrupted turn.
+      this.#lastSpeaker = { id: userId, at: Date.now() };
+      this.#turnSpeakers.add(userId);
+      this.gemini?.sendAudio(pcm48StereoTo16Mono(chunk));
+    });
 
     const finish = () => {
       if (!this.#speakers.delete(userId)) return;

@@ -13,12 +13,14 @@ for (const key of ['DISCORD_TOKEN', 'DISCORD_CLIENT_ID', 'GEMINI_API_KEY']) {
   }
 }
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-  ],
-});
+// Presence is a privileged intent: requesting it without enabling it in the
+// Developer Portal makes login fail outright, so it stays opt-in.
+const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
+if (process.env.ENABLE_PRESENCE === '1') {
+  intents.push(GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMembers);
+}
+
+const client = new Client({ intents });
 
 client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}. Use /join in a voice channel.`);
@@ -112,4 +114,15 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   });
 }
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+  if (/disallowed intents/i.test(err.message)) {
+    console.error(
+      '\n❌ Discord rejected the privileged intents.\n' +
+        '   You set ENABLE_PRESENCE=1, so the bot asks for Presence + Server Members.\n' +
+        '   Enable both under Developer Portal -> your app -> Bot -> Privileged Gateway Intents,\n' +
+        '   or unset ENABLE_PRESENCE to run without the activity feature.\n',
+    );
+    process.exit(1);
+  }
+  throw err;
+});

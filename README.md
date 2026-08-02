@@ -85,6 +85,80 @@ npm start
 Join a voice channel, run `/join`, and just talk. Transcripts of each turn get
 posted to the text channel you ran the command in.
 
+## Voice moderation
+
+Say what you want and Gemini calls the matching tool — "mute Alex", "give Sam
+the Member role", "kick Jordan out of the call", "delete the last ten messages".
+
+| Tool | Required permission |
+| --- | --- |
+| `mute_member` / `deafen_member` | Mute Members / Deafen Members |
+| `disconnect_member` | Move Members |
+| `move_member` | Move Members |
+| `get_member_activity` | none (read-only, needs `ENABLE_PRESENCE=1`) |
+| `timeout_member` | Timeout Members |
+| `manage_role` | Manage Roles |
+| `delete_messages` | Manage Messages |
+| `list_members` | none (read-only) |
+
+**Authorisation is checked against the person who spoke, not the bot.** If a
+user without Mute Members says "mute Alex", it's refused — otherwise anyone able
+to join the voice channel could borrow the bot's admin rights by talking. On top
+of that:
+
+- Discord's role hierarchy is enforced for *both* parties: you can't act on
+  someone ranked at or above you, and neither can the bot.
+- The server owner and yourself are never valid targets.
+- If the bot can't confidently tell who spoke (nobody talked in the last 30s),
+  it refuses rather than guessing.
+- Ambiguous names make it ask instead of picking someone.
+- Every action is posted to the text channel, so voice moderation leaves a trail.
+
+Attribution uses the most recent speaker, which is reliable in normal
+conversation but is a heuristic — if two people talk over each other as a
+command lands, it could attribute to the wrong one. The permission and hierarchy
+checks still apply to whoever it picks, so the blast radius is limited to people
+who already hold the permission.
+
+**Try it in dry-run first.** Set `MOD_DRY_RUN=1` and everything is logged and
+narrated but nothing actually changes — worth doing while you learn how well it
+hears your server's names.
+
+### Member activity
+
+"What's Sam playing?" reports their game, Spotify track, stream, or status.
+This needs the **privileged** presence intent, so it's opt-in:
+
+1. Developer Portal → your app → Bot → Privileged Gateway Intents
+2. Enable **Presence Intent** and **Server Members Intent**
+3. Set `ENABLE_PRESENCE=1`
+
+Order matters — requesting the intent before enabling it makes login fail
+outright. Left unset, the bot runs normally and only this one tool is
+unavailable. Nothing is reported for members who are invisible or who hide
+their activity.
+
+### Spoken profanity filter
+
+Off by default. Set `PROFANITY_FILTER=1` to enable: first offence gets a spoken
+warning, the next gets an automatic server mute that lifts itself after
+`PROFANITY_MUTE_MIN` minutes. Strikes reset after `PROFANITY_DECAY_MIN` minutes
+of clean speech, so one slip doesn't follow someone around all night.
+
+Customise the word list in `profanity.txt` (one word per line, `#` for comments)
+or via `PROFANITY_WORDS`. The built-in default is deliberately small.
+
+Matching folds case, padding ("fuuuck"), and symbol substitution ("sh!t"), and
+is whole-word — "Scunthorpe", "assassin", "shiitake" and "pass" don't trigger it.
+
+**The important limitation:** this punishes automatically, with nobody
+reviewing it. Two things can go wrong — speech-to-text mishears, and with
+several people talking the transcript can't be pinned to one speaker. So
+enforcement only runs when **exactly one person spoke during that turn**;
+overlapping voices are skipped and logged. It also can't tell a slur from a
+quotation or someone discussing the word. Run it with `MOD_DRY_RUN=1` for a
+while and read the log before letting it mute anyone for real.
+
 ## Free tier notes
 
 - The Live API on the free tier allows a small number of concurrent sessions and
@@ -110,7 +184,9 @@ posted to the text channel you ran the command in.
 | [src/index.js](src/index.js) | Discord client, slash-command handlers |
 | [src/voice-session.js](src/voice-session.js) | Per-guild session: voice connection ↔ Gemini wiring |
 | [src/gemini-live.js](src/gemini-live.js) | Live API WebSocket wrapper, emits `audio` / `text` / `interrupted` |
+| [src/moderation-tools.js](src/moderation-tools.js) | Tool schemas + permission/hierarchy enforcement |
 | [src/audio.js](src/audio.js) | Resampling and the continuous playback stream |
+| [src/single-instance.js](src/single-instance.js) | Refuses to start a second copy |
 
 ## Secrets & Security
 

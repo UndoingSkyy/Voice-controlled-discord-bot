@@ -1,0 +1,17 @@
+# Copy to profanity.txt to use your own list.
+# One word per line. Blank lines and # comments are ignored.
+#
+# Matching already handles case, padding ("fuuuck"), symbol swaps ("sh!t"),
+# and whole words only — so list the plain base word and nothing else.
+# Add each inflection you care about; "fuck" alone will not catch "fucking".
+
+fuck
+fucking
+fucker
+shit
+bullshit
+bitch
+bastard
+asshole
+cunt
+prick

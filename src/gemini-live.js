@@ -19,8 +19,23 @@ export class GeminiLiveSession extends EventEmitter {
   #session = null;
   #closed = false;
 
+  /**
+   * @param {object} [opts]
+   * @param {Array}  [opts.functionDeclarations] tools Gemini may call
+   * @param {string} [opts.extraInstruction]     appended to the system prompt
+   */
+  constructor(opts = {}) {
+    super();
+    this.functionDeclarations = opts.functionDeclarations ?? [];
+    this.extraInstruction = opts.extraInstruction ?? '';
+  }
+
   async connect() {
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+    const base =
+      process.env.SYSTEM_PROMPT ||
+      'You are a friendly voice assistant in a Discord voice channel. Keep replies short.';
 
     this.#session = await ai.live.connect({
       model: MODEL,
@@ -29,9 +44,10 @@ export class GeminiLiveSession extends EventEmitter {
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } },
         },
-        systemInstruction:
-          process.env.SYSTEM_PROMPT ||
-          'You are a friendly voice assistant in a Discord voice channel. Keep replies short.',
+        ...(this.functionDeclarations.length
+          ? { tools: [{ functionDeclarations: this.functionDeclarations }] }
+          : {}),
+        systemInstruction: [base, this.extraInstruction].filter(Boolean).join('\n\n'),
         // Ask for transcripts so we can mirror the conversation into text chat.
         inputAudioTranscription: {},
         outputAudioTranscription: {},
@@ -51,6 +67,10 @@ export class GeminiLiveSession extends EventEmitter {
   }
 
   #onMessage(msg) {
+    if (msg.toolCall?.functionCalls?.length) {
+      this.emit('toolCall', msg.toolCall.functionCalls);
+    }
+
     const sc = msg.serverContent;
     if (!sc) return;
 
@@ -95,6 +115,16 @@ export class GeminiLiveSession extends EventEmitter {
     if (this.#closed || !this.#session) return;
     try {
       this.#session.sendRealtimeInput({ audioStreamEnd: true });
+    } catch (err) {
+      this.emit('error', err);
+    }
+  }
+
+  /** Hand tool results back so the model can speak the outcome. */
+  sendToolResponse(functionResponses) {
+    if (this.#closed || !this.#session) return;
+    try {
+      this.#session.sendToolResponse({ functionResponses });
     } catch (err) {
       this.emit('error', err);
     }
