@@ -93,6 +93,31 @@ Almost everything is also available by voice — moderation, music, memory,
 search and images are all tools the model can call. The slash commands are just
 a direct route to the common ones.
 
+## Response latency
+
+Measured time from asking to the first audio byte:
+
+| Model | First audio |
+| --- | --- |
+| `gemini-3.1-flash-live-preview` | **~775 ms** |
+| `gemini-2.5-flash-native-audio-latest` | ~2100 ms |
+
+The model choice dominates everything else — the 2.5 native-audio models have a
+warmer voice but are roughly three times slower to start speaking.
+
+On top of the model, three timers add delay to *every* reply, and all of them
+are silence the bot waits through before it will answer:
+
+| Setting | Default | What it costs |
+| --- | --- | --- |
+| `VAD_SILENCE_MS` | 350 | Silence before Gemini calls the turn finished |
+| `TURN_SILENCE_MS` | 300 | Silence before Discord closes the audio stream |
+| `SPEECH_HANGOVER_MS` | 350 | Extra silence still being streamed to Gemini |
+
+Lower them for snappier replies; too low and a pause mid-sentence gets treated
+as the end of your turn, so the bot answers half a question. Raise them if it
+keeps interrupting you.
+
 ## Staying connected
 
 Gemini Live sessions expire after roughly ten minutes. The bot doesn't end the

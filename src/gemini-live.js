@@ -2,7 +2,30 @@ import { EventEmitter } from 'node:events';
 import { GoogleGenAI, Modality } from '@google/genai';
 
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash-live-001';
-const VOICE = process.env.GEMINI_VOICE || 'Puck';
+
+/**
+ * A wrong voice name is a nasty failure: the socket opens normally and only
+ * dies on the first reply, with "No matching speaker voice found". Catching the
+ * typo here turns a mystery into a one-line message.
+ */
+const VOICES = [
+  'Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede',
+  'Leda', 'Orus', 'Zephyr',
+];
+
+function resolveVoice() {
+  const wanted = (process.env.GEMINI_VOICE || 'Puck').trim();
+  const match = VOICES.find((v) => v.toLowerCase() === wanted.toLowerCase());
+  if (match) return match;
+
+  console.warn(
+    `[gemini] GEMINI_VOICE="${wanted}" is not a known voice — falling back to Puck. ` +
+      `Valid: ${VOICES.join(', ')}`,
+  );
+  return 'Puck';
+}
+
+const VOICE = resolveVoice();
 
 /**
  * One live WebSocket session with Gemini.
@@ -67,6 +90,15 @@ export class GeminiLiveSession extends EventEmitter {
         // Ask for transcripts so we can mirror the conversation into text chat.
         inputAudioTranscription: {},
         outputAudioTranscription: {},
+        // How long the server waits for silence before deciding a turn ended.
+        // The default is generous; most of the "why is it so slow to answer"
+        // feeling is this timer, not the model thinking.
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            silenceDurationMs: Number(process.env.VAD_SILENCE_MS ?? 350),
+            prefixPaddingMs: Number(process.env.VAD_PREFIX_MS ?? 100),
+          },
+        },
         // Live sessions expire after ~10 minutes. With resumption enabled the
         // server hands out handles that let a new socket pick up the same
         // conversation, so a reconnect doesn't lose the last ten minutes.

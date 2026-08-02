@@ -22,14 +22,23 @@ import { moderationDeclarations, executeTool, autoMute } from './moderation-tool
 import { ProfanityGuard } from './profanity-guard.js';
 import { MusicPlayer } from './music.js';
 
-/** How long a user must be quiet before we treat their turn as finished. */
-const SILENCE_MS = 500;
+/**
+ * How long a user must be quiet before we treat their turn as finished.
+ *
+ * This is pure added latency on every single reply: nothing is sent onward
+ * until Discord ends the subscription. Too low and a pause mid-sentence splits
+ * the turn; 300 ms is about the shortest that still survives normal speech.
+ */
+const SILENCE_MS = Number(process.env.TURN_SILENCE_MS ?? 300);
 
 /** Speech gate tuning — raise the threshold in a noisy room. */
 const GATE = {
   threshold: Number(process.env.NOISE_GATE_RMS ?? 500),
   minSpeechMs: Number(process.env.MIN_SPEECH_MS ?? 120),
-  hangoverMs: Number(process.env.SPEECH_HANGOVER_MS ?? 700),
+  // Every millisecond of hangover is silence still being streamed to Gemini,
+  // which holds its own end-of-speech timer open. Keep it just long enough to
+  // bridge the gaps between words.
+  hangoverMs: Number(process.env.SPEECH_HANGOVER_MS ?? 350),
 };
 
 /** How long one speaker keeps the floor after they stop being audible. */
@@ -37,6 +46,13 @@ const FLOOR_RELEASE_MS = Number(process.env.FLOOR_RELEASE_MS ?? 800);
 
 /** Attempts before giving up on the Gemini connection entirely. */
 const MAX_RECONNECTS = Number(process.env.GEMINI_MAX_RECONNECT ?? 5);
+
+/**
+ * Wait after a quota rejection. Free-tier limits are per minute, so the budget
+ * refills on its own — the mistake is reconnecting immediately and spending the
+ * refill on another rejection.
+ */
+const QUOTA_BACKOFF_MS = Number(process.env.QUOTA_BACKOFF_SEC ?? 30) * 1000;
 
 /** Ignore an attributed speaker older than this when a tool call arrives. */
 const SPEAKER_TTL_MS = 30_000;
@@ -358,8 +374,23 @@ class VoiceSession {
     this.#reconnecting = true;
     console.warn(`[gemini] reconnecting: ${reason}`);
 
+    // A quota close is a rate limit, not a broken socket. Reconnecting a second
+    // later just trips the same per-minute limit and burns the retry budget, so
+    // wait out the window instead.
+    const rateLimited = /quota|exceeded|RESOURCE_EXHAUSTED|429/i.test(reason ?? '');
+    if (rateLimited) {
+      console.warn(`[gemini] rate limited — waiting ${QUOTA_BACKOFF_MS / 1000}s before reconnecting`);
+      this.textChannel
+        ?.send(`⏳ Hit Gemini's per-minute limit. Reconnecting in ${QUOTA_BACKOFF_MS / 1000}s…`)
+        .catch(() => {});
+    }
+
     for (let attempt = 1; attempt <= MAX_RECONNECTS; attempt++) {
-      const wait = immediate && attempt === 1 ? 0 : Math.min(1000 * 2 ** (attempt - 1), 15_000);
+      const wait = rateLimited
+        ? QUOTA_BACKOFF_MS * attempt
+        : immediate && attempt === 1
+          ? 0
+          : Math.min(1000 * 2 ** (attempt - 1), 15_000);
       if (wait) await new Promise((r) => setTimeout(r, wait));
       if (this.#closing) return;
 
