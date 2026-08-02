@@ -28,9 +28,17 @@ export class GeminiLiveSession extends EventEmitter {
     super();
     this.functionDeclarations = opts.functionDeclarations ?? [];
     this.extraInstruction = opts.extraInstruction ?? '';
+    /** Let the model run Google searches and answer from live results. */
+    this.enableSearch = opts.enableSearch ?? false;
+    /** Latest resumption handle, or null until the server issues one. */
+    this.resumeHandle = opts.resumeHandle ?? null;
   }
 
-  async connect() {
+  /**
+   * @param {string|null} resumeHandle handle from a previous session, to carry
+   *   its conversation history across a reconnect
+   */
+  async connect(resumeHandle = null) {
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     const base =
@@ -44,13 +52,25 @@ export class GeminiLiveSession extends EventEmitter {
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } },
         },
-        ...(this.functionDeclarations.length
-          ? { tools: [{ functionDeclarations: this.functionDeclarations }] }
+        // Search grounding and our own functions can coexist in one tools list.
+        ...(this.functionDeclarations.length || this.enableSearch
+          ? {
+              tools: [
+                ...(this.enableSearch ? [{ googleSearch: {} }] : []),
+                ...(this.functionDeclarations.length
+                  ? [{ functionDeclarations: this.functionDeclarations }]
+                  : []),
+              ],
+            }
           : {}),
         systemInstruction: [base, this.extraInstruction].filter(Boolean).join('\n\n'),
         // Ask for transcripts so we can mirror the conversation into text chat.
         inputAudioTranscription: {},
         outputAudioTranscription: {},
+        // Live sessions expire after ~10 minutes. With resumption enabled the
+        // server hands out handles that let a new socket pick up the same
+        // conversation, so a reconnect doesn't lose the last ten minutes.
+        sessionResumption: resumeHandle ? { handle: resumeHandle } : {},
       },
       callbacks: {
         onopen: () => this.emit('open'),
@@ -67,6 +87,20 @@ export class GeminiLiveSession extends EventEmitter {
   }
 
   #onMessage(msg) {
+    // The server periodically hands out a handle for the conversation so far.
+    if (msg.sessionResumptionUpdate) {
+      const { newHandle, resumable } = msg.sessionResumptionUpdate;
+      if (resumable && newHandle) {
+        this.resumeHandle = newHandle;
+        this.emit('resumable', newHandle);
+      }
+    }
+
+    // Advance warning that this socket is about to be closed.
+    if (msg.goAway) {
+      this.emit('goAway', msg.goAway.timeLeft ?? null);
+    }
+
     if (msg.toolCall?.functionCalls?.length) {
       this.emit('toolCall', msg.toolCall.functionCalls);
     }
@@ -79,6 +113,18 @@ export class GeminiLiveSession extends EventEmitter {
     for (const part of sc.modelTurn?.parts ?? []) {
       const data = part.inlineData?.data;
       if (data) this.emit('audio', Buffer.from(data, 'base64'));
+    }
+
+    // Where a grounded answer came from, so the chat post can cite it.
+    if (sc.groundingMetadata) {
+      const meta = sc.groundingMetadata;
+      const sources = (meta.groundingChunks ?? [])
+        .map((c) => c.web)
+        .filter((w) => w?.uri)
+        .map((w) => ({ title: w.title || new URL(w.uri).hostname, uri: w.uri }));
+      if (sources.length || meta.webSearchQueries?.length) {
+        this.emit('grounding', { sources, queries: meta.webSearchQueries ?? [] });
+      }
     }
 
     if (sc.inputTranscription?.text) {
@@ -115,6 +161,25 @@ export class GeminiLiveSession extends EventEmitter {
     if (this.#closed || !this.#session) return;
     try {
       this.#session.sendRealtimeInput({ audioStreamEnd: true });
+    } catch (err) {
+      this.emit('error', err);
+    }
+  }
+
+  /**
+   * Announce who is about to talk.
+   *
+   * Everyone in the channel arrives as one audio stream, so without this the
+   * model hears a single voice that keeps changing its mind. `turnComplete` is
+   * false: this is context attached to the turn, not a prompt to answer.
+   */
+  sendSpeakerLabel(name) {
+    if (this.#closed || !this.#session) return;
+    try {
+      this.#session.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: `[${name} is now speaking]` }] }],
+        turnComplete: false,
+      });
     } catch (err) {
       this.emit('error', err);
     }

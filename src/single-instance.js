@@ -37,6 +37,8 @@ export function claimSingleInstance() {
 
   fs.writeFileSync(LOCK, String(process.pid));
 
+  // 'exit' fires on normal exit, process.exit(), and uncaught exceptions alike,
+  // so it is the only hook needed to clean up the lock.
   const release = () => fs.rmSync(LOCK, { force: true });
   process.on('exit', release);
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -45,9 +47,4 @@ export function claimSingleInstance() {
       process.exit(0);
     });
   }
-  process.on('uncaughtException', (err) => {
-    release();
-    console.error(err);
-    process.exit(1);
-  });
 }

@@ -9,6 +9,24 @@ const commands = [
     .setName('leave')
     .setDescription('End the conversation and leave the voice channel'),
   new SlashCommandBuilder()
+    .setName('play')
+    .setDescription('Play a local track, a radio station, or a direct audio link')
+    .addStringOption((o) =>
+      o.setName('query').setDescription('Track name, radio station (lofi, jazz…), or URL').setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Stop the music'),
+  new SlashCommandBuilder()
+    .setName('skip')
+    .setDescription('Skip to the next track in the queue'),
+  new SlashCommandBuilder()
+    .setName('waifu')
+    .setDescription('Post a random anime image from waifu.im')
+    .addStringOption((o) =>
+      o.setName('tag').setDescription('e.g. waifu, maid, uniform, raiden-shogun').setRequired(false),
+    ),
+  new SlashCommandBuilder()
     .setName('say')
     .setDescription('Send a typed message into the ongoing voice conversation')
     .addStringOption((o) =>

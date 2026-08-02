@@ -1,8 +1,10 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Events, MessageFlags } from 'discord.js';
 
-import { startSession, stopSession, getSession } from './voice-session.js';
+import { startSession, stopSession, getSession, activityKey } from './voice-session.js';
 import { claimSingleInstance } from './single-instance.js';
+import { postImage } from './waifu.js';
+import { startReminderLoop } from './memory.js';
 
 claimSingleInstance();
 
@@ -19,11 +21,85 @@ const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
 if (process.env.ENABLE_PRESENCE === '1') {
   intents.push(GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMembers);
 }
+if (process.env.READ_MESSAGES === '1') {
+  // MessageContent is privileged too: without it every message arrives blank.
+  intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+}
+if (process.env.WELCOME_VOICE === '1' && !intents.includes(GatewayIntentBits.GuildMembers)) {
+  intents.push(GatewayIntentBits.GuildMembers); // needed for guildMemberAdd
+}
 
 const client = new Client({ intents });
 
+/**
+ * A malformed voice packet arrives on a UDP callback, so anything thrown there
+ * is an uncaught exception with no owner. Losing one packet is not a reason to
+ * drop everyone's call, so those are logged and survived; anything else is
+ * genuinely unexpected and still terminates.
+ */
+const SURVIVABLE = /Failed to decrypt|DecryptionFailed|UnencryptedWhenPassthrough/i;
+
+process.on('uncaughtException', (err) => {
+  if (SURVIVABLE.test(err?.message ?? '')) {
+    console.warn(`[voice] ignored bad packet: ${err.message.split('\n')[0]}`);
+    return;
+  }
+  console.error('Fatal:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (err) => {
+  if (SURVIVABLE.test(err?.message ?? '')) return;
+  console.error('Unhandled rejection:', err);
+});
+
 client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}. Use /join in a voice channel.`);
+  // Reminders outlive both the call and the process, so this runs whether or
+  // not the bot is currently in a voice channel.
+  startReminderLoop(c, getSession);
+});
+
+// Someone in a voice channel started a game / put music on. Only newly-started
+// activities count, so an unchanged presence heartbeat doesn't trigger chatter.
+client.on(Events.PresenceUpdate, (oldPresence, newPresence) => {
+  if (process.env.PROACTIVE_ACTIVITY !== '1') return;
+  const member = newPresence?.member;
+  if (!member) return;
+
+  const session = getSession(member.guild.id);
+  if (!session) return;
+
+  const before = new Set((oldPresence?.activities ?? []).map(activityKey));
+  const started = (newPresence.activities ?? []).filter(
+    (a) => a.type !== 4 && !before.has(activityKey(a)), // type 4 is a custom status
+  );
+  if (started.length) session.notePresenceChange(member, started[0]);
+});
+
+// Read messages typed in the /join channel out loud.
+client.on(Events.MessageCreate, (message) => {
+  if (process.env.READ_MESSAGES !== '1' || !message.guildId) return;
+  getSession(message.guildId)?.speakMessage(message);
+});
+
+// Greet people arriving in the bot's voice channel.
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  if (process.env.WELCOME_VOICE !== '1') return;
+  if (oldState.channelId === newState.channelId) return; // mute/deafen, not a move
+
+  const session = getSession(newState.guild.id);
+  if (!session || !newState.member) return;
+  if (newState.channelId !== session.voiceChannel.id) return;
+  if (newState.member.id === client.user.id) return; // that's us arriving
+
+  session.welcome(newState.member);
+});
+
+// Greet people brand new to the server, if the bot is currently in voice.
+client.on(Events.GuildMemberAdd, (member) => {
+  if (process.env.WELCOME_VOICE !== '1') return;
+  getSession(member.guild.id)?.welcome(member, { joinedServer: true });
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -44,6 +120,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return await handleLeave(interaction);
       case 'say':
         return await handleSay(interaction);
+      case 'waifu':
+        return await handleWaifu(interaction);
+      case 'play':
+      case 'stop':
+      case 'skip':
+        return await handleMusic(interaction);
     }
   } catch (err) {
     // 10062 = Discord already discarded this interaction (usually a duplicate
@@ -93,6 +175,46 @@ async function handleLeave(interaction) {
   await interaction.reply(stopped ? '👋 Left the voice channel.' : "I'm not in a voice channel.");
 }
 
+async function handleMusic(interaction) {
+  const session = getSession(interaction.guildId);
+  if (!session?.music) {
+    return interaction.reply({
+      content: 'Run `/join` first — I need to be in a voice channel to play anything.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  await interaction.deferReply();
+  const { music } = session;
+  try {
+    if (interaction.commandName === 'stop') {
+      music.stop();
+      return await interaction.editReply('⏹️ Stopped.');
+    }
+    if (interaction.commandName === 'skip') {
+      return await interaction.editReply(`⏭️ Skipped **${music.skip()}**.`);
+    }
+    const title = music.play(interaction.options.getString('query', true));
+    await interaction.editReply(`▶️ Playing **${title}**`);
+  } catch (err) {
+    await interaction.editReply(`❌ ${err.message}`.slice(0, 1900));
+  }
+}
+
+async function handleWaifu(interaction) {
+  await interaction.deferReply();
+  const tag = interaction.options.getString('tag');
+  try {
+    await postImage(interaction.channel, {
+      tags: tag ? [tag] : [],
+      requestedBy: interaction.member?.displayName,
+    });
+    await interaction.deleteReply().catch(() => {});
+  } catch (err) {
+    await interaction.editReply(`❌ ${err.message}`.slice(0, 1900));
+  }
+}
+
 async function handleSay(interaction) {
   const session = getSession(interaction.guildId);
   if (!session) {
@@ -116,11 +238,19 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 
 client.login(process.env.DISCORD_TOKEN).catch((err) => {
   if (/disallowed intents/i.test(err.message)) {
+    const needed = [
+      process.env.ENABLE_PRESENCE === '1' && 'Presence Intent (ENABLE_PRESENCE)',
+      (process.env.ENABLE_PRESENCE === '1' || process.env.WELCOME_VOICE === '1') &&
+        'Server Members Intent (ENABLE_PRESENCE / WELCOME_VOICE)',
+      process.env.READ_MESSAGES === '1' && 'Message Content Intent (READ_MESSAGES)',
+    ].filter(Boolean);
+
     console.error(
-      '\n❌ Discord rejected the privileged intents.\n' +
-        '   You set ENABLE_PRESENCE=1, so the bot asks for Presence + Server Members.\n' +
-        '   Enable both under Developer Portal -> your app -> Bot -> Privileged Gateway Intents,\n' +
-        '   or unset ENABLE_PRESENCE to run without the activity feature.\n',
+      '\n❌ Discord rejected the privileged intents this bot asked for:\n' +
+        needed.map((n) => `     - ${n}`).join('\n') +
+        '\n\n   Enable them under Developer Portal -> your app -> Bot ->\n' +
+        '   Privileged Gateway Intents, then start again. Or unset the\n' +
+        '   matching variable in .env to run without that feature.\n',
     );
     process.exit(1);
   }

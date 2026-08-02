@@ -1,5 +1,8 @@
 import { PermissionFlagsBits } from 'discord.js';
 import { Type } from '@google/genai';
+import { waifuDeclarations, waifuHandlers } from './waifu.js';
+import { memoryDeclarations, memoryHandlers } from './memory.js';
+import { musicDeclarations, musicHandlers } from './music.js';
 
 /**
  * Voice-driven moderation.
@@ -12,13 +15,25 @@ import { Type } from '@google/genai';
 
 const DRY_RUN = Boolean(process.env.MOD_DRY_RUN);
 
-/** Tool schema handed to Gemini. */
+/** Tool schema handed to Gemini: moderation plus the waifu.im tools. */
 export const moderationDeclarations = [
+  ...memoryDeclarations,
+  ...musicDeclarations,
+  ...waifuDeclarations,
   {
     name: 'list_members',
     description:
-      'List members currently in the voice channel, with their roles. Use this to resolve ' +
-      'an ambiguous or partially-heard name before acting on someone.',
+      'List everyone in ALL voice channels of the server, grouped by channel, with their ' +
+      'roles. You can act on members in any voice channel, not only your own. Use this to ' +
+      'resolve an ambiguous or partially-heard name before acting on someone.',
+    parameters: { type: Type.OBJECT, properties: {} },
+  },
+  {
+    name: 'list_channels',
+    description:
+      'List every voice channel in the server, including empty ones, with how many people are ' +
+      'in each. Call this before saying a channel does not exist — list_members only shows ' +
+      'channels that currently have people in them.',
     parameters: { type: Type.OBJECT, properties: {} },
   },
   {
@@ -58,7 +73,9 @@ export const moderationDeclarations = [
   },
   {
     name: 'move_member',
-    description: 'Move a member from their current voice channel into a different one.',
+    description:
+      'Move a member from their current voice channel into a different one. Works for members ' +
+      'in any voice channel — they do not need to be in the same channel as you.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -130,35 +147,114 @@ export const moderationDeclarations = [
 /* Resolution helpers                                                   */
 /* ------------------------------------------------------------------ */
 
-const norm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+/**
+ * Fold a spoken or displayed name to a comparable key.
+ *
+ * NFKD matters more than it looks: Discord names are full of styled Unicode
+ * ("𝖯𝖠𝖱𝖠𝖪𝖨𝖤𝖳", "ＴＨＥ ＰＵＢ"), and those letters are not ASCII. Without
+ * decomposing them first, stripping non-alphanumerics leaves an empty string
+ * and the channel or member can never be matched by name.
+ */
+const norm = (s) =>
+  String(s ?? '')
+    .normalize('NFKD')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+/** Everyone in any voice channel of the guild, excluding a given channel. */
+function voiceMembersElsewhere(ctx) {
+  const out = [];
+  for (const ch of ctx.guild.channels.cache.values()) {
+    if (!ch.isVoiceBased?.() || ch.id === ctx.voiceChannel.id) continue;
+    out.push(...ch.members.values());
+  }
+  return out;
+}
+
+/** Levenshtein distance, abandoned early once it exceeds `max`. */
+function editDistance(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      row[j] = Math.min(
+        prev[j] + 1,
+        row[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+      best = Math.min(best, row[j]);
+    }
+    if (best > max) return max + 1;
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+/** Normalised name forms for a member, with unusable (empty) ones dropped. */
+function nameForms(m) {
+  return [m.displayName, m.user?.username, m.nickname]
+    .filter(Boolean)
+    .map(norm)
+    .filter((n) => n.length > 0);
+}
 
 /**
- * Find a member by spoken name. Speech-to-text mangles names, so we try
- * progressively looser matches, and we prefer people in the voice channel
- * because that's who a voice command is almost always about.
+ * Find a member by spoken name.
+ *
+ * Speech-to-text mangles names, so matching has to be forgiving — but a loose
+ * match that picks the wrong person gets someone muted by mistake, so looseness
+ * is rationed: exact first, then prefix, then substring with a length floor.
+ * Decorated Discord names normalise to nothing at all, and those are discarded
+ * rather than allowed to match everything.
  */
 function resolveMember(ctx, spoken) {
   const want = norm(spoken);
   if (!want) return null;
 
-  const inVoice = [...ctx.voiceChannel.members.values()];
-  const pools = [inVoice, [...ctx.guild.members.cache.values()]];
+  // Prefer whoever is in the bot's channel, then anyone else in voice, then the
+  // wider guild — a bot can act on members it isn't sitting next to.
+  const pools = [
+    [...ctx.voiceChannel.members.values()],
+    voiceMembersElsewhere(ctx),
+    [...ctx.guild.members.cache.values()],
+  ];
 
   for (const pool of pools) {
-    const names = (m) => [m.displayName, m.user.username, m.nickname].filter(Boolean);
-
-    const exact = pool.find((m) => names(m).some((n) => norm(n) === want));
+    const exact = pool.find((m) => nameForms(m).some((n) => n === want));
     if (exact) return exact;
 
-    const partial = pool.filter((m) =>
-      names(m).some((n) => norm(n).includes(want) || want.includes(norm(n))),
+    // Nobody says "mute me" by naming themselves, and the bot isn't a target
+    // either. Excluding both stops a sloppy match from landing on the speaker.
+    const candidates = pool.filter(
+      (m) => m.id !== ctx.requester?.id && m.id !== ctx.guild.members.me?.id,
     );
+
+    const matches = (m) =>
+      nameForms(m).some((n) => {
+        if (n.startsWith(want) || want.startsWith(n)) return true;
+        // Substring either way, but only for names long enough to be meaningful.
+        const shorter = Math.min(n.length, want.length);
+        return shorter >= 3 && (n.includes(want) || want.includes(n));
+      });
+
+    let partial = candidates.filter(matches);
+
+    // Last resort for a misheard name ("rok" for "Rock"): allow a single
+    // character of difference, and only when exactly one person is that close.
+    if (partial.length === 0 && want.length >= 3) {
+      partial = candidates.filter((m) =>
+        nameForms(m).some((n) => n.length >= 3 && editDistance(n, want, 1) <= 1),
+      );
+    }
+
     if (partial.length === 1) return partial[0];
     if (partial.length > 1) {
       const err = new Error(
-        `"${spoken}" matches ${partial.length} people: ${partial
+        `"${spoken}" could be ${partial.length} different people: ${partial
           .map((m) => m.displayName)
-          .join(', ')}. Ask which one.`,
+          .join(', ')}. Ask which one they mean.`,
       );
       err.ambiguous = true;
       throw err;
@@ -199,8 +295,14 @@ function assertHierarchy(ctx, target) {
   if (!isOwner && ctx.requester.roles.highest.comparePositionTo(target.roles.highest) <= 0) {
     throw new Error(`${target.displayName} is ranked at or above you, so you cannot moderate them.`);
   }
-  if (ctx.guild.members.me.roles.highest.comparePositionTo(target.roles.highest) <= 0) {
-    throw new Error(`My role is below ${target.displayName}'s, so Discord won't let me act.`);
+  const me = ctx.guild.members.me;
+  if (me.roles.highest.comparePositionTo(target.roles.highest) <= 0) {
+    // Not a permissions problem — Discord blocks this even for administrators.
+    throw new Error(
+      `This is a role hierarchy problem, not a missing permission. My role ` +
+        `"${me.roles.highest.name}" sits below ${target.displayName}'s role ` +
+        `"${target.roles.highest.name}". Drag my role higher in Server Settings then Roles.`,
+    );
   }
 }
 
@@ -224,53 +326,98 @@ function assertPermission(ctx, flag, label, channel = ctx.voiceChannel) {
 const reason = (ctx) => `Voice command by ${ctx.requester.user.tag}`;
 
 const handlers = {
+  ...waifuHandlers,
+  ...memoryHandlers,
+  ...musicHandlers,
+
+  list_channels(ctx) {
+    const me = ctx.guild.members.me;
+    const channels = [];
+    for (const ch of ctx.guild.channels.cache.values()) {
+      if (!ch.isVoiceBased?.()) continue;
+      channels.push({
+        name: ch.name,
+        people: ch.members?.size ?? 0,
+        is_my_channel: ch.id === ctx.voiceChannel.id,
+        can_move_people_here: Boolean(
+          ch.permissionsFor(me)?.has(PermissionFlagsBits.MoveMembers),
+        ),
+      });
+    }
+    if (!channels.length) throw new Error('I cannot see any voice channels in this server.');
+    return { voice_channels: channels };
+  },
+
   list_members(ctx) {
-    const members = [...ctx.voiceChannel.members.values()].map((m) => ({
+    const describe = (m) => ({
       name: m.displayName,
       roles: m.roles.cache.filter((r) => r.name !== '@everyone').map((r) => r.name),
       muted: m.voice.serverMute ?? false,
-    }));
-    return { members };
+    });
+
+    // Report every voice channel, not just ours — members elsewhere can still
+    // be moved, muted or disconnected.
+    const channels = [];
+    for (const ch of ctx.guild.channels.cache.values()) {
+      if (!ch.isVoiceBased?.() || ch.members.size === 0) continue;
+      channels.push({
+        channel: ch.name,
+        is_my_channel: ch.id === ctx.voiceChannel.id,
+        members: [...ch.members.values()].map(describe),
+      });
+    }
+    return { voice_channels: channels };
   },
 
   async mute_member(ctx, { target, mute }) {
-    assertPermission(ctx, PermissionFlagsBits.MuteMembers, 'Mute Members');
     const member = mustFind(ctx, target);
-    assertHierarchy(ctx, member);
     if (!member.voice.channel) throw new Error(`${member.displayName} is not in a voice channel.`);
+    // The permission that matters is the one in *their* channel, not ours.
+    assertPermission(ctx, PermissionFlagsBits.MuteMembers, 'Mute Members', member.voice.channel);
+    assertHierarchy(ctx, member);
 
     if (!DRY_RUN) await member.voice.setMute(Boolean(mute), reason(ctx));
     return { done: `${mute ? 'Muted' : 'Unmuted'} ${member.displayName}` };
   },
 
   async deafen_member(ctx, { target, deafen }) {
-    assertPermission(ctx, PermissionFlagsBits.DeafenMembers, 'Deafen Members');
     const member = mustFind(ctx, target);
-    assertHierarchy(ctx, member);
     if (!member.voice.channel) throw new Error(`${member.displayName} is not in a voice channel.`);
+    assertPermission(ctx, PermissionFlagsBits.DeafenMembers, 'Deafen Members', member.voice.channel);
+    assertHierarchy(ctx, member);
 
     if (!DRY_RUN) await member.voice.setDeaf(Boolean(deafen), reason(ctx));
     return { done: `${deafen ? 'Deafened' : 'Undeafened'} ${member.displayName}` };
   },
 
   async disconnect_member(ctx, { target }) {
-    assertPermission(ctx, PermissionFlagsBits.MoveMembers, 'Move Members');
     const member = mustFind(ctx, target);
-    assertHierarchy(ctx, member);
     if (!member.voice.channel) throw new Error(`${member.displayName} is not in a voice channel.`);
+    assertPermission(ctx, PermissionFlagsBits.MoveMembers, 'Move Members', member.voice.channel);
+    assertHierarchy(ctx, member);
 
     if (!DRY_RUN) await member.voice.disconnect(reason(ctx));
     return { done: `Disconnected ${member.displayName}` };
   },
 
   async move_member(ctx, { target, channel }) {
-    assertPermission(ctx, PermissionFlagsBits.MoveMembers, 'Move Members');
     const member = mustFind(ctx, target);
-    assertHierarchy(ctx, member);
     if (!member.voice.channel) throw new Error(`${member.displayName} is not in a voice channel.`);
+    // Moving needs the permission in the channel they're leaving and the one
+    // they're arriving in.
+    assertPermission(ctx, PermissionFlagsBits.MoveMembers, 'Move Members', member.voice.channel);
+    assertHierarchy(ctx, member);
 
     const dest = resolveVoiceChannel(ctx, channel);
-    if (!dest) throw new Error(`No voice channel called "${channel}".`);
+    if (!dest) {
+      const available = [...ctx.guild.channels.cache.values()]
+        .filter((c) => c.isVoiceBased?.())
+        .map((c) => c.name);
+      throw new Error(
+        `No voice channel called "${channel}".` +
+          (available.length ? ` The voice channels are: ${available.join(', ')}.` : ''),
+      );
+    }
     if (dest.id === member.voice.channelId) {
       throw new Error(`${member.displayName} is already in ${dest.name}.`);
     }
@@ -278,9 +425,7 @@ const handlers = {
     if (!dest.permissionsFor(member)?.has(PermissionFlagsBits.Connect)) {
       throw new Error(`${member.displayName} isn't allowed into ${dest.name}.`);
     }
-    if (!dest.permissionsFor(ctx.guild.members.me)?.has(PermissionFlagsBits.MoveMembers)) {
-      throw new Error(`I can't move people into ${dest.name}.`);
-    }
+    assertPermission(ctx, PermissionFlagsBits.MoveMembers, 'Move Members', dest);
 
     if (!DRY_RUN) await member.voice.setChannel(dest, reason(ctx));
     return { done: `Moved ${member.displayName} to ${dest.name}` };
@@ -407,8 +552,74 @@ export async function autoMute(member, ms, why) {
 
 function mustFind(ctx, spoken) {
   const member = resolveMember(ctx, spoken);
-  if (!member) throw new Error(`I couldn't find anyone called "${spoken}".`);
+  if (!member) {
+    // Name the people actually present, so the model can offer real options
+    // instead of guessing again at a name it already misheard.
+    const here = [...ctx.voiceChannel.members.values()]
+      .filter((m) => m.id !== ctx.guild.members.me?.id)
+      .map((m) => m.displayName);
+    throw new Error(
+      `I couldn't find anyone called "${spoken}".` +
+        (here.length ? ` In this channel I can see: ${here.join(', ')}.` : ''),
+    );
+  }
   return member;
+}
+
+/**
+ * Actions that cannot be undone, with a plain description for the prompt.
+ *
+ * These are enforced in two phases. Asking the model to "confirm first" is not
+ * enough: it happily performs the action, then asks, then performs it a second
+ * time when the person agrees — deleting ten messages when five were wanted.
+ * The first call here never acts, so a double-run is impossible.
+ */
+const DESTRUCTIVE = {
+  delete_messages: (a) =>
+    `delete the last ${a.count} message(s)${a.from_member ? ` from ${a.from_member}` : ''}`,
+  disconnect_member: (a) => `disconnect ${a.target} from voice`,
+  timeout_member: (a) =>
+    Number(a.minutes) > 0 ? `time ${a.target} out for ${a.minutes} minute(s)` : null,
+  // Someone may be relying on a stored number or reminder; deleting it silently
+  // on a misheard word is the same class of mistake as over-deleting messages.
+  forget_memory: (a) => `forget what was saved about "${a.query}"`,
+};
+
+const CONFIRM_TTL_MS = Number(process.env.MOD_CONFIRM_TTL_SEC ?? 120) * 1000;
+const CONFIRM_ENABLED = process.env.MOD_CONFIRM_DESTRUCTIVE !== '0';
+const pendingConfirm = new Map(); // signature -> requested at
+
+function confirmationGate(name, args, ctx) {
+  if (!CONFIRM_ENABLED) return null;
+  const describe = DESTRUCTIVE[name];
+  if (!describe) return null;
+
+  const what = describe(args ?? {});
+  if (!what) return null; // e.g. clearing a timeout, which is not destructive
+
+  const key = `${ctx.guild?.id}:${ctx.requester?.id}:${name}:${JSON.stringify(args ?? {})}`;
+  const requestedAt = pendingConfirm.get(key);
+
+  if (requestedAt && Date.now() - requestedAt <= CONFIRM_TTL_MS) {
+    pendingConfirm.delete(key); // agreed to — let it through
+    return null;
+  }
+
+  // Drop stale entries so an abandoned request cannot be "confirmed" much later.
+  for (const [k, at] of pendingConfirm) {
+    if (Date.now() - at > CONFIRM_TTL_MS) pendingConfirm.delete(k);
+  }
+  pendingConfirm.set(key, Date.now());
+
+  return {
+    needs_confirmation: true,
+    about_to: what,
+    instruction:
+      `NOTHING HAS HAPPENED YET. Ask out loud whether to ${what}, then stop and wait. ` +
+      'If they agree, call this tool again with exactly the same arguments and it will ' +
+      'go ahead. If they decline or change the number, do not call it again with these ' +
+      'arguments.',
+  };
 }
 
 /**
@@ -419,12 +630,29 @@ export async function executeTool(name, args, ctx) {
   const handler = handlers[name];
   if (!handler) return { error: `Unknown tool "${name}".` };
 
-  if (!ctx.requester) {
-    return { error: "I couldn't tell who asked, so I won't run a moderation command." };
+  // Read-only lookups and image posting are harmless without knowing exactly
+  // who spoke; anything that changes a member's state is not.
+  const NEEDS_IDENTITY = ![
+    'list_members', 'list_channels', 'list_waifu_tags', 'send_waifu_image',
+    'get_current_time', 'recall_memory', 'list_music', 'control_music',
+  ].includes(name);
+  if (NEEDS_IDENTITY && !ctx.requester) {
+    return { error: "I couldn't tell who asked, so I won't run that command." };
   }
 
   try {
+    // Validate before asking, so "I can't find Rock" surfaces now rather than
+    // after someone has already agreed to something.
+    if (DESTRUCTIVE[name] && args?.target) mustFind(ctx, args.target);
+
+    const gate = confirmationGate(name, args, ctx);
+    if (gate) {
+      console.log(`[mod] ${ctx.requester.user.tag}: ${name} awaiting confirmation — ${gate.about_to}`);
+      return gate;
+    }
+
     const result = await handler(ctx, args ?? {});
+    if (result.posted) console.log(`[waifu] ${ctx.requester?.user?.tag ?? '?'}: ${result.posted}`);
     if (result.done) {
       console.log(`[mod] ${ctx.requester.user.tag}: ${name} -> ${result.done}`);
       if (DRY_RUN) result.done += ' (dry run — nothing actually changed)';

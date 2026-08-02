@@ -1,7 +1,24 @@
 node_modules/
-.env
-*.log
 
+# Secrets — never commit these
+.env
+.env.local
+
+# Runtime state, per-machine
 .bot.lock
-bot.log
+*.log
+bot.err
+
+# Data the bot writes at runtime
+memory-store.json
+waifu-prefs.json
 profanity.txt
+
+# Your own music library
+music/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
