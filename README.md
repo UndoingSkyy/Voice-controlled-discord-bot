@@ -74,6 +74,7 @@ npm run deploy -- YOUR_GUILD_ID
 npm start
 ```
 
+
 ## Commands
 
 | Command | What it does |

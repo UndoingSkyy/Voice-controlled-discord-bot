@@ -48,7 +48,7 @@ export class GeminiLiveSession extends EventEmitter {
     this.#session = await ai.live.connect({
       model: MODEL,
       config: {
-        responseModalities: [Modality.AUDIO],
+        responseModalities: [Modality.AUDIO],  
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } },
         },
