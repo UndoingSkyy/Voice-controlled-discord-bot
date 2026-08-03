@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Type } from '@google/genai';
+import * as transcript from './transcript.js';
 
 /**
  * Things the bot has been asked to remember, and reminders to deliver later.
@@ -138,6 +139,22 @@ export const memoryDeclarations = [
     parameters: { type: Type.OBJECT, properties: {} },
   },
   {
+    name: 'set_reply_language',
+    description:
+      'Change which language you reply in. Use when someone says "speak Hindi", ' +
+      '"reply in English", "हिंदी में बात करो", or similar.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        language: {
+          type: Type.STRING,
+          description: 'hindi, english, or auto (mirror whichever they spoke)',
+        },
+      },
+      required: ['language'],
+    },
+  },
+  {
     name: 'remember_this',
     description:
       'Store something for later: a fact, a phone number, a preference, a decision. ' +
@@ -179,12 +196,39 @@ export const memoryDeclarations = [
   {
     name: 'recall_memory',
     description:
-      'Look up what has been remembered. Omit the query to list everything recent.',
+      "Look up what YOU remembered for the person now speaking. Their notes are private " +
+      'to them. Omit the query to list their recent ones.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         query: { type: Type.STRING, description: 'Words to search for, e.g. a name or topic' },
       },
+    },
+  },
+  {
+    name: 'catch_up',
+    description:
+      'Summarise what was said in the voice channel recently. Use for "what did I miss", ' +
+      '"what happened", "what did we decide". You get the raw lines with names and times — ' +
+      'read them and give a short spoken summary of what actually matters.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        minutes: { type: Type.NUMBER, description: 'How far back to look, default 30' },
+      },
+    },
+  },
+  {
+    name: 'search_conversation',
+    description:
+      'Find where something was mentioned in the recent voice conversation — a name, a ' +
+      'topic, a decision. Use for "did anyone mention X" or "what did Rock say about Y".',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        query: { type: Type.STRING, description: 'Words to look for' },
+      },
+      required: ['query'],
     },
   },
   {
@@ -207,6 +251,24 @@ export const memoryHandlers = {
       iso: now.toISOString(),
       local: now.toLocaleString(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    };
+  },
+
+  /**
+   * Switching language is only a change of instruction, so it takes effect on
+   * the next reply without reconnecting.
+   */
+  set_reply_language(ctx, { language }) {
+    const want = String(language ?? '').trim().toLowerCase();
+    const choice = ['hindi', 'english', 'auto'].find((l) => want.includes(l));
+    if (!choice) throw new Error('I can reply in Hindi, English, or auto.');
+
+    ctx.session?.setReplyLanguage(choice);
+    return {
+      done:
+        choice === 'auto'
+          ? 'Replying in whichever of Hindi or English is spoken to me'
+          : `Replying in ${choice} from now on`,
     };
   },
 
@@ -270,19 +332,59 @@ export const memoryHandlers = {
     return { done: `Reminder set for ${new Date(remindAt).toLocaleString()}: ${entry.content}` };
   },
 
+  /**
+   * Only ever returns the speaker's own notes.
+   *
+   * Several people share this bot and the same voice channel, so a shared pool
+   * would read one person's saved phone number out loud to whoever asked next.
+   * Private by default is the only sane setting.
+   */
   recall_memory(ctx, { query }) {
+    if (!ctx.requester) throw new Error("I can't tell who is asking, so I won't read anything out.");
+
     const found = search(ctx.guild.id, query)
+      .filter((e) => e.userId === ctx.requester.id)
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, 15);
+
     if (!found.length) {
-      return { memories: [], note: query ? `Nothing remembered about "${query}".` : 'Nothing remembered yet.' };
+      return {
+        memories: [],
+        note: query
+          ? `Nothing of ${ctx.requester.displayName}'s about "${query}".`
+          : `${ctx.requester.displayName} hasn't asked me to remember anything yet.`,
+      };
     }
-    return { memories: found.map(describe) };
+    return { memories: found.map(describe), whose: ctx.requester.displayName };
+  },
+
+  catch_up(ctx, { minutes }) {
+    if (!transcript.enabled()) throw new Error('Conversation history is turned off.');
+    const window = Math.min(Math.max(Number(minutes) || 30, 1), 180);
+    const lines = transcript.since(ctx.guild.id, window);
+    if (!lines.length) {
+      return { note: `Nothing was said in the last ${window} minutes that I heard.` };
+    }
+    return {
+      window_minutes: window,
+      speakers: [...new Set(lines.map((l) => l.who))],
+      conversation: transcript.format(lines).slice(-120),
+      instruction:
+        'Summarise this out loud in a few sentences: what was discussed, anything decided, ' +
+        'and anything aimed at the person asking. Skip small talk.',
+    };
+  },
+
+  search_conversation(ctx, { query }) {
+    if (!transcript.enabled()) throw new Error('Conversation history is turned off.');
+    const hits = transcript.search(ctx.guild.id, query);
+    if (!hits.length) return { found: 0, note: `Nobody mentioned "${query}" recently.` };
+    return { found: hits.length, lines: transcript.format(hits).slice(-25) };
   },
 
   forget_memory(ctx, { query }) {
-    const found = search(ctx.guild.id, query);
-    if (!found.length) throw new Error(`Nothing remembered matching "${query}".`);
+    const found = search(ctx.guild.id, query).filter((e) => e.userId === ctx.requester?.id);
+    if (!found.length) throw new Error(`You have nothing saved matching "${query}".`);
     if (found.length > 1) {
       throw new Error(
         `That matches ${found.length} items: ${found

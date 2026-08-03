@@ -27,6 +27,9 @@ function resolveVoice() {
 
 const VOICE = resolveVoice();
 
+/** Drive turn boundaries from our own noise gate instead of the server's VAD. */
+const MANUAL_TURNS = process.env.MANUAL_TURNS === '1';
+
 /**
  * One live WebSocket session with Gemini.
  *
@@ -90,15 +93,23 @@ export class GeminiLiveSession extends EventEmitter {
         // Ask for transcripts so we can mirror the conversation into text chat.
         inputAudioTranscription: {},
         outputAudioTranscription: {},
-        // How long the server waits for silence before deciding a turn ended.
-        // The default is generous; most of the "why is it so slow to answer"
-        // feeling is this timer, not the model thinking.
-        realtimeInputConfig: {
-          automaticActivityDetection: {
-            silenceDurationMs: Number(process.env.VAD_SILENCE_MS ?? 350),
-            prefixPaddingMs: Number(process.env.VAD_PREFIX_MS ?? 100),
-          },
-        },
+        /**
+         * Turn detection.
+         *
+         * With server-side detection Gemini treats *any* audio it receives as
+         * someone talking, so in a noisy channel it interrupts itself
+         * constantly. We already know who is speaking and when — the noise gate
+         * and floor control decide it locally — so with MANUAL_TURNS the server
+         * is told to stop guessing and to trust explicit start/end markers.
+         */
+        realtimeInputConfig: MANUAL_TURNS
+          ? { automaticActivityDetection: { disabled: true } }
+          : {
+              automaticActivityDetection: {
+                silenceDurationMs: Number(process.env.VAD_SILENCE_MS ?? 350),
+                prefixPaddingMs: Number(process.env.VAD_PREFIX_MS ?? 100),
+              },
+            },
         // Live sessions expire after ~10 minutes. With resumption enabled the
         // server hands out handles that let a new socket pick up the same
         // conversation, so a reconnect doesn't lose the last ten minutes.
@@ -167,6 +178,30 @@ export class GeminiLiveSession extends EventEmitter {
     }
 
     if (sc.turnComplete) this.emit('turnComplete');
+  }
+
+  /**
+   * Mark the start of a real utterance. Only used with manual turn detection:
+   * audio sent outside a start/end pair is not treated as someone speaking, so
+   * background noise cannot interrupt the bot.
+   */
+  startActivity() {
+    if (this.#closed || !this.#session || !MANUAL_TURNS) return;
+    try {
+      this.#session.sendRealtimeInput({ activityStart: {} });
+    } catch (err) {
+      this.emit('error', err);
+    }
+  }
+
+  /** Mark the end of an utterance, which is what makes Gemini answer. */
+  endActivity() {
+    if (this.#closed || !this.#session || !MANUAL_TURNS) return;
+    try {
+      this.#session.sendRealtimeInput({ activityEnd: {} });
+    } catch (err) {
+      this.emit('error', err);
+    }
   }
 
   /** Push a chunk of 16 kHz mono s16le microphone audio. */

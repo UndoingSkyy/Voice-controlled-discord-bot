@@ -2,7 +2,7 @@ import { PermissionFlagsBits } from 'discord.js';
 import { Type } from '@google/genai';
 import { waifuDeclarations, waifuHandlers } from './waifu.js';
 import { memoryDeclarations, memoryHandlers } from './memory.js';
-import { musicDeclarations, musicHandlers } from './music.js';
+import { adminDeclarations, adminHandlers } from './admin-tools.js';
 
 /**
  * Voice-driven moderation.
@@ -18,7 +18,7 @@ const DRY_RUN = Boolean(process.env.MOD_DRY_RUN);
 /** Tool schema handed to Gemini: moderation plus the waifu.im tools. */
 export const moderationDeclarations = [
   ...memoryDeclarations,
-  ...musicDeclarations,
+  ...adminDeclarations,
   ...waifuDeclarations,
   {
     name: 'list_members',
@@ -326,9 +326,9 @@ function assertPermission(ctx, flag, label, channel = ctx.voiceChannel) {
 const reason = (ctx) => `Voice command by ${ctx.requester.user.tag}`;
 
 const handlers = {
+  ...adminHandlers,
   ...waifuHandlers,
   ...memoryHandlers,
-  ...musicHandlers,
 
   list_channels(ctx) {
     const me = ctx.guild.members.me;
@@ -525,31 +525,6 @@ const handlers = {
   },
 };
 
-/**
- * Mute applied by the bot itself rather than on someone's instruction, so it
- * checks only the bot's own capability. Auto-unmutes so a mistake expires
- * without needing anyone to notice it.
- */
-export async function autoMute(member, ms, why) {
-  const me = member.guild.members.me;
-  if (!member.voice.channel) throw new Error('not in a voice channel');
-  if (!member.voice.channel.permissionsFor(me)?.has(PermissionFlagsBits.MuteMembers)) {
-    throw new Error('I lack the Mute Members permission');
-  }
-  if (me.roles.highest.comparePositionTo(member.roles.highest) <= 0) {
-    throw new Error('their role is above mine');
-  }
-  if (member.id === member.guild.ownerId) throw new Error('they are the server owner');
-
-  if (DRY_RUN) return { dryRun: true };
-
-  await member.voice.setMute(true, why);
-  setTimeout(() => {
-    member.voice.setMute(false, 'Automatic mute expired').catch(() => {});
-  }, ms).unref?.();
-  return { dryRun: false };
-}
-
 function mustFind(ctx, spoken) {
   const member = resolveMember(ctx, spoken);
   if (!member) {
@@ -575,6 +550,12 @@ function mustFind(ctx, spoken) {
  * The first call here never acts, so a double-run is impossible.
  */
 const DESTRUCTIVE = {
+  kick_member: (a) => `kick ${a.target} from the server`,
+  ban_member: (a) => `BAN ${a.target} from the server`,
+  manage_channel: (a) => (String(a.action).toLowerCase() === 'delete' ? `delete the channel "${a.name}"` : null),
+  manage_server_role: (a) => (String(a.action).toLowerCase() === 'delete' ? `delete the role "${a.name}"` : null),
+  mute_everyone: (a) => (a.mute ? `mute everyone in the voice channel` : null),
+  move_everyone: (a) => `move everyone into ${a.to}`,
   delete_messages: (a) =>
     `delete the last ${a.count} message(s)${a.from_member ? ` from ${a.from_member}` : ''}`,
   disconnect_member: (a) => `disconnect ${a.target} from voice`,
@@ -583,6 +564,23 @@ const DESTRUCTIVE = {
   // Someone may be relying on a stored number or reminder; deleting it silently
   // on a misheard word is the same class of mistake as over-deleting messages.
   forget_memory: (a) => `forget what was saved about "${a.query}"`,
+};
+
+/**
+ * The permission each destructive action needs, checked *before* the
+ * confirmation prompt. Handlers check it again when they actually run; this
+ * copy exists only so an unauthorised request is refused rather than queued.
+ */
+const DESTRUCTIVE_PERMISSION = {
+  kick_member: [PermissionFlagsBits.KickMembers, 'Kick Members'],
+  ban_member: [PermissionFlagsBits.BanMembers, 'Ban Members'],
+  disconnect_member: [PermissionFlagsBits.MoveMembers, 'Move Members'],
+  timeout_member: [PermissionFlagsBits.ModerateMembers, 'Timeout Members'],
+  delete_messages: [PermissionFlagsBits.ManageMessages, 'Manage Messages'],
+  manage_channel: [PermissionFlagsBits.ManageChannels, 'Manage Channels'],
+  manage_server_role: [PermissionFlagsBits.ManageRoles, 'Manage Roles'],
+  mute_everyone: [PermissionFlagsBits.MuteMembers, 'Mute Members'],
+  move_everyone: [PermissionFlagsBits.MoveMembers, 'Move Members'],
 };
 
 const CONFIRM_TTL_MS = Number(process.env.MOD_CONFIRM_TTL_SEC ?? 120) * 1000;
@@ -634,16 +632,26 @@ export async function executeTool(name, args, ctx) {
   // who spoke; anything that changes a member's state is not.
   const NEEDS_IDENTITY = ![
     'list_members', 'list_channels', 'list_waifu_tags', 'send_waifu_image',
-    'get_current_time', 'recall_memory', 'list_music', 'control_music',
+    'get_current_time', 'catch_up', 'search_conversation', 'server_info', 'member_info', 'list_bans', 'set_reply_language',
   ].includes(name);
   if (NEEDS_IDENTITY && !ctx.requester) {
     return { error: "I couldn't tell who asked, so I won't run that command." };
   }
 
+  // Admin handlers live in another module; hand them the shared checks rather
+  // than importing back into this one and creating a cycle.
+  ctx.helpers = { mustFind, assertPermission, assertHierarchy, resolveMember };
+
   try {
     // Validate before asking, so "I can't find Rock" surfaces now rather than
     // after someone has already agreed to something.
     if (DESTRUCTIVE[name] && args?.target) mustFind(ctx, args.target);
+
+    // And check they're allowed at all before asking them to confirm —
+    // otherwise a user with no permission is invited to approve something that
+    // was never going to happen.
+    const needed = DESTRUCTIVE_PERMISSION[name];
+    if (needed) assertPermission(ctx, needed[0], needed[1], ctx.textChannel);
 
     const gate = confirmationGate(name, args, ctx);
     if (gate) {

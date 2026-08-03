@@ -135,11 +135,6 @@ export class SpeechGate {
 const FRAME_BYTES = 3840; // 20 ms of 48 kHz stereo s16le
 const SILENCE = Buffer.alloc(FRAME_BYTES);
 
-/** Music level while the bot is speaking, and how fast it gets there. */
-const DUCK_GAIN = Number(process.env.MUSIC_DUCK ?? 0.2);
-const DUCK_SPEED = 0.0008; // per sample; ~90 ms to settle at 48 kHz
-const DUCK_HOLD_MS = 400; // keep music low through pauses between words
-
 /**
  * A never-ending 48 kHz stereo PCM stream. Feed it Gemini audio with write();
  * it emits silence whenever the queue is empty so the Discord player never
@@ -148,10 +143,6 @@ const DUCK_HOLD_MS = 400; // keep music low through pauses between words
 export class SpeakerStream extends Readable {
   #queue = [];
   #pending = Buffer.alloc(0);
-  #music = null; // readable of 48k stereo PCM
-  #musicVolume = 0.5;
-  #duck = 1; // current music gain, moved gradually toward the target
-  #lastSpeechAt = 0;
 
   constructor() {
     // Keep the read buffer tiny: anything buffered ahead is silence that would
@@ -161,54 +152,6 @@ export class SpeakerStream extends Readable {
 
   write(chunk) {
     this.#queue.push(chunk);
-  }
-
-  /** Attach (or clear) a music source to mix underneath speech. */
-  setMusic(stream, volume = this.#musicVolume) {
-    if (this.#music && this.#music !== stream) this.#music.destroy?.();
-    this.#music = stream ?? null;
-    this.#musicVolume = volume;
-    this.#music?.on?.('error', () => {
-      this.#music = null;
-    });
-  }
-
-  setMusicVolume(volume) {
-    this.#musicVolume = volume;
-  }
-
-  get hasMusic() {
-    return Boolean(this.#music);
-  }
-
-  /**
-   * Mix one frame of music under one frame of speech.
-   *
-   * Music drops to a fraction of its volume while the bot is talking —
-   * otherwise the two fight and neither is intelligible. The gain moves
-   * gradually rather than jumping, because an instant change is audible as a
-   * click.
-   */
-  #mix(speech, speaking) {
-    if (!this.#music) return speech;
-
-    const music = this.#music.read(FRAME_BYTES);
-    if (!music || music.length < FRAME_BYTES) return speech;
-
-    // Hold the duck briefly after the last speech frame, so music doesn't surge
-    // back up in the gaps between words.
-    if (speaking) this.#lastSpeechAt = Date.now();
-    const target = Date.now() - this.#lastSpeechAt < DUCK_HOLD_MS ? DUCK_GAIN : 1;
-    const out = Buffer.allocUnsafe(FRAME_BYTES);
-
-    for (let i = 0; i < FRAME_BYTES; i += 2) {
-      // Ease toward the target so the level change is smooth, not a step.
-      this.#duck += (target - this.#duck) * DUCK_SPEED;
-      const mixed =
-        speech.readInt16LE(i) + music.readInt16LE(i) * this.#musicVolume * this.#duck;
-      out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(mixed))), i);
-    }
-    return out;
   }
 
   /** Drop everything still queued — used when the user barges in. */
@@ -226,18 +169,12 @@ export class SpeakerStream extends Readable {
       this.#pending = Buffer.concat([this.#pending, this.#queue.shift()]);
     }
 
-    // Decide this *before* consuming the frame: after the slice both buffers
-    // can be empty even though this very frame is speech.
-    const speaking = this.#pending.length >= FRAME_BYTES;
-
-    let frame;
-    if (speaking) {
-      frame = this.#pending.subarray(0, FRAME_BYTES);
+    if (this.#pending.length >= FRAME_BYTES) {
+      const frame = this.#pending.subarray(0, FRAME_BYTES);
       this.#pending = this.#pending.subarray(FRAME_BYTES);
+      this.push(frame);
     } else {
-      frame = SILENCE;
+      this.push(SILENCE);
     }
-
-    this.push(this.#mix(frame, speaking));
   }
 }

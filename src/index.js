@@ -122,10 +122,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return await handleSay(interaction);
       case 'waifu':
         return await handleWaifu(interaction);
-      case 'play':
-      case 'stop':
-      case 'skip':
-        return await handleMusic(interaction);
     }
   } catch (err) {
     // 10062 = Discord already discarded this interaction (usually a duplicate
@@ -165,40 +161,24 @@ async function handleJoin(interaction) {
   }
 
   await startSession(channel, interaction.channel);
+
+  // Say plainly that it keeps a record. People should know before they talk,
+  // not find out later.
+  const retention = process.env.TRANSCRIPT_RETAIN_MIN ?? 120;
+  const notice =
+    process.env.TRANSCRIPT === '0'
+      ? ''
+      : `\n📝 I keep a short record of what's said so anyone can ask "what did I miss?" — ` +
+        `held for ${retention} minutes, and cleared when I leave.`;
+
   await interaction.editReply(
-    `🎙️ Connected to **${channel.name}** — just start talking. \`/leave\` when you're done.`,
+    `🎙️ Connected to **${channel.name}** — just start talking. \`/leave\` when you're done.${notice}`,
   );
 }
 
 async function handleLeave(interaction) {
   const stopped = await stopSession(interaction.guildId);
   await interaction.reply(stopped ? '👋 Left the voice channel.' : "I'm not in a voice channel.");
-}
-
-async function handleMusic(interaction) {
-  const session = getSession(interaction.guildId);
-  if (!session?.music) {
-    return interaction.reply({
-      content: 'Run `/join` first — I need to be in a voice channel to play anything.',
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  await interaction.deferReply();
-  const { music } = session;
-  try {
-    if (interaction.commandName === 'stop') {
-      music.stop();
-      return await interaction.editReply('⏹️ Stopped.');
-    }
-    if (interaction.commandName === 'skip') {
-      return await interaction.editReply(`⏭️ Skipped **${music.skip()}**.`);
-    }
-    const title = music.play(interaction.options.getString('query', true));
-    await interaction.editReply(`▶️ Playing **${title}**`);
-  } catch (err) {
-    await interaction.editReply(`❌ ${err.message}`.slice(0, 1900));
-  }
 }
 
 async function handleWaifu(interaction) {

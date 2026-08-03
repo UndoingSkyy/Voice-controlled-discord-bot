@@ -18,9 +18,8 @@ import {
   pcm48StereoTo16Mono,
   pcm24MonoTo48Stereo,
 } from './audio.js';
-import { moderationDeclarations, executeTool, autoMute } from './moderation-tools.js';
-import { ProfanityGuard } from './profanity-guard.js';
-import { MusicPlayer } from './music.js';
+import { moderationDeclarations, executeTool } from './moderation-tools.js';
+import * as transcript from './transcript.js';
 
 /**
  * How long a user must be quiet before we treat their turn as finished.
@@ -44,6 +43,13 @@ const GATE = {
 /** How long one speaker keeps the floor after they stop being audible. */
 const FLOOR_RELEASE_MS = Number(process.env.FLOOR_RELEASE_MS ?? 800);
 
+/**
+ * While the bot is speaking, how much louder and longer someone must be to
+ * interrupt it. Without this, any room noise cuts it off mid-sentence.
+ */
+const BARGE_IN_FACTOR = Number(process.env.BARGE_IN_FACTOR ?? 1.8);
+const BARGE_IN_MS = Number(process.env.BARGE_IN_MS ?? 250);
+
 /** Attempts before giving up on the Gemini connection entirely. */
 const MAX_RECONNECTS = Number(process.env.GEMINI_MAX_RECONNECT ?? 5);
 
@@ -53,6 +59,14 @@ const MAX_RECONNECTS = Number(process.env.GEMINI_MAX_RECONNECT ?? 5);
  * refill on another rejection.
  */
 const QUOTA_BACKOFF_MS = Number(process.env.QUOTA_BACKOFF_SEC ?? 30) * 1000;
+
+/**
+ * Gemini occasionally closes a session with "Internal error encountered" — a
+ * transient fault on their side, not something the bot did. Reconnecting is
+ * right; reconnecting forever at one-second intervals is not.
+ */
+const FLAP_WINDOW_MS = Number(process.env.FLAP_WINDOW_SEC ?? 180) * 1000;
+const FLAP_LIMIT = Number(process.env.FLAP_LIMIT ?? 6);
 
 /** Ignore an attributed speaker older than this when a tool call arrives. */
 const SPEAKER_TTL_MS = 30_000;
@@ -132,10 +146,48 @@ ambiguous — several people match a name — or when a tool tells you confirmat
 is required. Those are safety checks, not conversation.
 `.trim();
 
-const PROFANITY_ENABLED = process.env.PROFANITY_FILTER === '1';
+/**
+ * Which language the bot speaks. `auto` mirrors whichever of the two the
+ * speaker used, which is what people actually want in a Hinglish channel.
+ */
+const BOT_LANGUAGE = (process.env.BOT_LANGUAGE || 'auto').toLowerCase();
 
-/** Name that wakes the bot. Empty means it replies to everything, as before. */
-const WAKE_WORD = (process.env.WAKE_WORD ?? '').trim();
+export const REPLY_RULE_FOR = (lang) =>
+  ({
+    hindi: 'Always reply in Hindi, whichever of the two languages was spoken to you.',
+    english: 'Always reply in English, whichever of the two languages was spoken to you.',
+    auto:
+      'Reply in whichever of the two the person used. If they mix Hindi and English ' +
+      'in one sentence (Hinglish), reply the same way — that is normal here, not an error.',
+  })[lang] ?? 'Reply in whichever of the two the person used.';
+
+const languageInstruction = (lang) => `
+LANGUAGE — this is a hard rule.
+
+You understand exactly two languages: Hindi and English. ${REPLY_RULE_FOR(lang)}
+
+If someone speaks to you in any other language — Spanish, French, Arabic,
+Tamil, Bengali, anything else — do not answer in it and do not translate it.
+Say one short line in English: that you only understand Hindi and English.
+
+Write Hindi in Devanagari script when it appears in text. Never reply in a
+language you were not spoken to in, and never switch language mid-answer.
+`.trim();
+
+/** Session default, overridable by voice. */
+const DEFAULT_LANGUAGE = ['hindi', 'english', 'auto'].includes(BOT_LANGUAGE)
+  ? BOT_LANGUAGE
+  : 'auto';
+
+/**
+ * Names that wake the bot. Comma-separated; when unset the bot's own Discord
+ * display name is used, because that is what people actually call it.
+ * `WAKE_WORD=off` disables the gate and answers everything.
+ */
+const WAKE_WORD_SETTING = (process.env.WAKE_WORD ?? '').trim();
+/** Hard playback gate. Off by default — the model decides if it was addressed. */
+const WAKE_STRICT = process.env.WAKE_STRICT === '1';
+
 /** After being addressed, keep replying this long so follow-ups feel natural. */
 const FOLLOW_UP_MS = Number(process.env.WAKE_FOLLOWUP_SEC ?? 45) * 1000;
 
@@ -175,12 +227,39 @@ export function activityKey(a) {
 const fold = (s) =>
   String(s ?? '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
 
-/** Did this utterance address the bot by name? Tolerates one misheard letter. */
+/**
+ * Names people might use for a bot called e.g. "boltaBakra": the whole thing,
+ * and each word of it. Speech recognition rarely returns a run-together name
+ * exactly, and people shorten names anyway.
+ */
+export function nameAliases(displayName) {
+  const clean = String(displayName ?? '').trim();
+  if (!clean) return [];
+
+  const out = new Set([clean]);
+  // Split camelCase and separators: "boltaBakra" -> bolta, Bakra
+  for (const part of clean.replace(/([a-z])([A-Z])/g, '$1 $2').split(/[\s_\-.]+/)) {
+    if (part.length >= 4) out.add(part);
+  }
+  return [...out];
+}
+
+/** Did this utterance address the bot? Tolerates one misheard letter. */
+function mentionsAnyWakeWord(text, wakeWords) {
+  return wakeWords.some((w) => mentionsWakeWord(text, w));
+}
+
 function mentionsWakeWord(text, wake) {
   const want = fold(wake).trim();
   if (!want) return false;
   const haystack = fold(text);
   if (haystack.includes(want)) return true;
+
+  // Run-together names get spoken — and transcribed — as separate words:
+  // "spongebob" is heard as "sponge bob". Compare with spacing removed.
+  const squashed = haystack.replace(/\s+/g, '');
+  const wantSquashed = want.replace(/\s+/g, '');
+  if (wantSquashed.length >= 5 && squashed.includes(wantSquashed)) return true;
 
   // Compare word by word so "Kamia"/"Camiya" still count.
   const target = want.replace(/ /g, '');
@@ -231,7 +310,6 @@ class VoiceSession {
   #transcript = { user: '', model: '' };
   #lastSpeaker = null; // { id, at } — who a tool call is attributed to
   #turnSpeakers = new Set(); // everyone who spoke during the current turn
-  #guard = PROFANITY_ENABLED ? new ProfanityGuard() : null;
   #respondUntil = 0; // replies are played while now() is below this
   #floor = null; // { userId, at } — whose audio is currently being forwarded
   #labelled = null; // userId we last announced to the model
@@ -239,13 +317,28 @@ class VoiceSession {
   #lastWelcome = new Map(); // userId -> when we last greeted them
   #lastRead = 0; // when we last read a typed message aloud
   #grounding = null; // search sources for the turn in progress
+  #activityOpen = false; // an utterance is currently open with the server
+  #language = DEFAULT_LANGUAGE; // changeable by voice, mid-session
   #resumeHandle = null; // lets a new socket continue the same conversation
   #reconnecting = false;
+  #recentReconnects = []; // timestamps, to notice a flapping session
   #closing = false; // set by destroy(), so a deliberate close isn't retried
 
   constructor(voiceChannel, textChannel) {
     this.voiceChannel = voiceChannel;
     this.textChannel = textChannel;
+
+    // People call the bot by whatever Discord shows, so that is the wake word
+    // unless one was configured explicitly.
+    const own = voiceChannel.guild.members.me?.displayName ?? '';
+    this.wakeWords =
+      WAKE_WORD_SETTING.toLowerCase() === 'off'
+        ? []
+        : WAKE_WORD_SETTING
+          ? WAKE_WORD_SETTING.split(',').map((w) => w.trim()).filter(Boolean)
+          : nameAliases(own);
+    if (this.wakeWords.length) console.log(`[voice] responds to: ${this.wakeWords.join(', ')}`);
+
     this.connection = null;
     this.player = null;
     this.speaker = null;
@@ -300,7 +393,6 @@ class VoiceSession {
     }
 
     this.speaker = new SpeakerStream();
-    this.music = new MusicPlayer(this.speaker);
     this.player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Play },
     });
@@ -332,16 +424,46 @@ class VoiceSession {
     });
   }
 
+  /**
+   * Change reply language for the rest of the session. This is only a change of
+   * instruction, so it applies to the next reply without reconnecting.
+   */
+  setReplyLanguage(choice) {
+    this.#language = choice;
+    console.log(`[voice] reply language -> ${choice}`);
+    this.gemini?.sendText(
+      `[system] Reply language changed. ${REPLY_RULE_FOR(choice)} ` +
+        'Acknowledge in one short sentence, in that language.',
+    );
+  }
+
   #instructions() {
     // Style comes first so it frames everything that follows.
-    const parts = [STYLE_INSTRUCTION, MULTI_SPEAKER_INSTRUCTION, NARRATION_INSTRUCTION, MODERATION_INSTRUCTION];
+    const parts = [
+      languageInstruction(this.#language),
+      STYLE_INSTRUCTION,
+      MULTI_SPEAKER_INSTRUCTION,
+      NARRATION_INSTRUCTION,
+      MODERATION_INSTRUCTION,
+    ];
     if (WEB_SEARCH) parts.push(SEARCH_INSTRUCTION);
-    if (WAKE_WORD) {
+
+    if (this.wakeWords.length) {
+      const [primary, ...rest] = this.wakeWords;
       parts.push(
-        `Your name is "${WAKE_WORD}". Several people share this channel and most ` +
-          'of what you hear is them talking to each other, not to you. Reply only ' +
-          'when someone says your name or is clearly continuing a conversation with ' +
-          'you. Otherwise say nothing at all — silence is the correct response.',
+        `YOUR NAME IS "${primary}".` +
+          (rest.length ? ` People also shorten it to: ${rest.join(', ')}.` : '') +
+          ` Speech recognition mangles names, so anything close to those — a ` +
+          `similar-sounding word at the start of a sentence — is probably you.\n\n` +
+          `Several people share this channel. Answer when someone is talking TO ` +
+          `you: they said your name, asked you a question, gave you an ` +
+          `instruction, or is continuing a conversation with you. When in doubt ` +
+          `about a direct question or a command, answer it — a missed request is ` +
+          `worse than one extra reply.\n\n` +
+          `Stay quiet when people are clearly talking to each other: chatter about ` +
+          `the game, side conversations, someone answering someone else. Do not ` +
+          `narrate, do not join in uninvited, and never answer a question ` +
+          `obviously aimed at another person.`,
       );
     }
     return parts.join('\n\n');
@@ -372,7 +494,41 @@ class VoiceSession {
   async #reconnect(reason, immediate = false) {
     if (this.#reconnecting || this.#closing) return;
     this.#reconnecting = true;
-    console.warn(`[gemini] reconnecting: ${reason}`);
+
+    // A reconnect that succeeds and then immediately fails again is a flap, not
+    // a recovery. Counting only per-attempt retries misses it entirely — the
+    // success resets the counter, so the loop runs forever a second apart.
+    const now = Date.now();
+    this.#recentReconnects = this.#recentReconnects.filter((t) => now - t < FLAP_WINDOW_MS);
+    this.#recentReconnects.push(now);
+    const flaps = this.#recentReconnects.length;
+
+    if (flaps > FLAP_LIMIT) {
+      console.error(`[gemini] ${flaps} reconnects in ${FLAP_WINDOW_MS / 1000}s — giving up`);
+      this.#reconnecting = false;
+      this.textChannel
+        ?.send(
+          "⚠️ Gemini keeps dropping the session, so I've stopped retrying. " +
+            'This is usually a hiccup on their side — run `/join` again in a minute.',
+        )
+        .catch(() => {});
+      stopSession(this.voiceChannel.guild.id);
+      return;
+    }
+
+    // Repeated failures may mean the resumption handle itself is being
+    // rejected; a fresh conversation is better than an endless loop.
+    if (flaps >= 3 && this.#resumeHandle) {
+      console.warn('[gemini] dropping resumption handle after repeated drops');
+      this.#resumeHandle = null;
+    }
+
+    // Back off according to how flappy things have been, not just this attempt.
+    const flapDelay = flaps > 1 ? Math.min(2000 * 2 ** (flaps - 2), 20_000) : 0;
+    if (flapDelay) await new Promise((r) => setTimeout(r, flapDelay));
+    if (this.#closing) return;
+
+    console.warn(`[gemini] reconnecting (${flaps} recently): ${reason}`);
 
     // A quota close is a rate limit, not a broken socket. Reconnecting a second
     // later just trips the same per-minute limit and burns the retry budget, so
@@ -417,9 +573,20 @@ class VoiceSession {
     stopSession(this.voiceChannel.guild.id);
   }
 
-  /** Should the bot be heard right now? */
+  /**
+   * Should the bot be heard right now?
+   *
+   * By default: yes. The model is told its name and told to stay quiet unless
+   * addressed, and it judges that far better than a string match can — speech
+   * recognition mangles names constantly, and a missed match means the bot goes
+   * silent for no reason the room can see.
+   *
+   * WAKE_STRICT=1 restores the hard gate: nothing is played unless the name was
+   * literally recognised. Quieter, but it will swallow real questions.
+   */
   get #awake() {
-    return !WAKE_WORD || Date.now() < this.#respondUntil;
+    if (!WAKE_STRICT || !this.wakeWords.length) return true;
+    return Date.now() < this.#respondUntil;
   }
 
   /** Let the bot speak for this exchange and any quick follow-up. */
@@ -450,7 +617,7 @@ class VoiceSession {
       this.#transcript[who] += chunk;
       // Check as the transcript streams in, so the decision is made before the
       // model's audio arrives.
-      if (who === 'user' && WAKE_WORD && mentionsWakeWord(this.#transcript.user, WAKE_WORD)) {
+      if (who === 'user' && this.wakeWords.length && mentionsAnyWakeWord(this.#transcript.user, this.wakeWords)) {
         this.#wake();
       }
     });
@@ -461,7 +628,18 @@ class VoiceSession {
 
       const spokeThisTurn = [...this.#turnSpeakers];
       this.#turnSpeakers.clear();
-      if (this.#guard && user.trim()) this.#checkLanguage(user, spokeThisTurn);
+
+      // Keep an attributed record, so "what did I miss?" has something to read.
+      if (user.trim()) {
+        const who =
+          spokeThisTurn.length === 1
+            ? (this.voiceChannel.members.get(spokeThisTurn[0])?.displayName ?? 'someone')
+            : 'someone';
+        transcript.record(this.voiceChannel.guild.id, who, user);
+      }
+      if (model.trim()) {
+        transcript.record(this.voiceChannel.guild.id, this.wakeWords[0] ?? 'bot', model);
+      }
 
       const heard = this.#awake;
       if (!heard) this.speaker.clear(); // drop anything that slipped through
@@ -536,65 +714,6 @@ class VoiceSession {
       return await this.voiceChannel.guild.members.fetch(last.id);
     } catch {
       return null;
-    }
-  }
-
-  /**
-   * Escalating profanity enforcement. Nobody reviews an automatic punishment,
-   * so this only fires when exactly one person spoke during the turn — with
-   * overlapping voices the transcript cannot be safely attributed, and muting
-   * the wrong person is worse than missing one.
-   */
-  async #checkLanguage(transcript, spokeThisTurn) {
-    if (spokeThisTurn.length !== 1) {
-      const hits = this.#guard.findHits(transcript);
-      if (hits.length) {
-        console.log(`[guard] skipped — ${spokeThisTurn.length} speakers overlapped, can't attribute`);
-      }
-      return;
-    }
-
-    const member = this.voiceChannel.members.get(spokeThisTurn[0]);
-    if (!member) return;
-
-    const verdict = this.#guard.evaluate(member.id, transcript);
-    if (!verdict) return;
-
-    console.log(`[guard] ${member.user.tag} strike ${verdict.count} -> ${verdict.action}`);
-
-    if (verdict.action === 'warn') {
-      this.gemini.sendText(
-        `[automated notice] ${member.displayName} used inappropriate language. ` +
-          'Warn them briefly and firmly that repeating it will get them muted. Do not repeat the word.',
-      );
-      this.textChannel
-        ?.send(`⚠️ **${member.displayName}** warned for language (strike 1).`)
-        .catch(() => {});
-      return;
-    }
-
-    const minutes = Math.round(this.#guard.muteMs / 60_000);
-    try {
-      const { dryRun } = await autoMute(
-        member,
-        this.#guard.muteMs,
-        `Repeated inappropriate language (strike ${verdict.count})`,
-      );
-      this.gemini.sendText(
-        `[automated notice] ${member.displayName} was warned already and did it again, ` +
-          `so they have been muted for ${minutes} minutes. Say so briefly. Do not repeat the word.`,
-      );
-      this.textChannel
-        ?.send(
-          `🔇 **${member.displayName}** muted for ${minutes} min — strike ${verdict.count}.` +
-            (dryRun ? ' *(dry run — not actually muted)*' : ''),
-        )
-        .catch(() => {});
-    } catch (err) {
-      console.warn(`[guard] could not mute ${member.user.tag}: ${err.message}`);
-      this.textChannel
-        ?.send(`⚠️ Wanted to mute **${member.displayName}** but couldn't: ${err.message}`)
-        .catch(() => {});
     }
   }
 
@@ -766,7 +885,7 @@ class VoiceSession {
       textChannel: this.textChannel,
       requester,
       presenceEnabled: process.env.ENABLE_PRESENCE === '1',
-      session: this, // music tools need the player attached to this session
+      session: this, // some tools change session state, e.g. reply language
     };
 
     const responses = [];
@@ -778,7 +897,7 @@ class VoiceSession {
       // Lookups and image posts speak for themselves and are skipped.
       const QUIET = [
         'list_members', 'list_channels', 'list_waifu_tags', 'send_waifu_image',
-        'get_current_time', 'recall_memory',
+        'get_current_time', 'recall_memory', 'catch_up', 'search_conversation', 'server_info', 'member_info',
       ];
       if (this.textChannel && !QUIET.includes(call.name)) {
         const who = requester?.displayName ?? 'unknown speaker';
@@ -811,6 +930,13 @@ class VoiceSession {
     const gate = new SpeechGate(GATE);
 
     pcm.on('data', (chunk) => {
+      // While the bot is talking, demand a clearly louder and longer utterance
+      // before treating it as an interruption. Otherwise a cough, a keyboard or
+      // someone else's conversation cuts the bot off mid-sentence.
+      const botTalking = this.speaker && !this.speaker.idle;
+      gate.threshold = botTalking ? GATE.threshold * BARGE_IN_FACTOR : GATE.threshold;
+      gate.minSpeechMs = botTalking ? BARGE_IN_MS : GATE.minSpeechMs;
+
       const voice = gate.push(pcm48StereoTo16Mono(chunk));
       if (!voice) return; // background noise, not speech
 
@@ -834,6 +960,12 @@ class VoiceSession {
         }
       }
 
+      // Tell Gemini a real utterance has begun, once per turn.
+      if (!this.#activityOpen) {
+        this.#activityOpen = true;
+        this.gemini?.startActivity();
+      }
+
       // Keep attribution fresh through a long uninterrupted turn.
       this.#lastSpeaker = { id: userId, at: now };
       this.#turnSpeakers.add(userId);
@@ -845,8 +977,16 @@ class VoiceSession {
       gate.reset();
       if (this.#floor?.userId === userId) this.#floor = null;
       decoder.destroy();
-      // Only close the audio turn once nobody else is still talking.
-      if (this.#speakers.size === 0) this.gemini?.endAudio();
+
+      // Only close the turn once nobody else is still talking. This is what
+      // makes Gemini answer, so it must not fire while someone is mid-sentence.
+      if (this.#speakers.size === 0) {
+        if (this.#activityOpen) {
+          this.#activityOpen = false;
+          this.gemini?.endActivity();
+        }
+        this.gemini?.endAudio();
+      }
     };
 
     pcm.on('end', finish);
@@ -858,7 +998,7 @@ class VoiceSession {
 
   destroy() {
     this.#closing = true; // stop the close handler from trying to reconnect
-    this.music?.stop();
+    transcript.clear(this.voiceChannel.guild.id); // the record does not outlive the call
     this.#speakers.clear();
     this.gemini?.close();
     this.player?.stop(true);

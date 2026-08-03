@@ -82,14 +82,12 @@ npm start
 | `/join` | Joins your current voice channel and opens the live session |
 | `/leave` | Ends the session and disconnects |
 | `/say <text>` | Types a message into the ongoing voice conversation |
-| `/play <query>` | Plays a local track, radio station, or direct audio link |
-| `/stop` · `/skip` | Stops the music, or moves to the next track |
 | `/waifu [tag]` | Posts an anime image |
 
 Join a voice channel, run `/join`, and just talk. Transcripts of each turn get
 posted to the text channel you ran the command in.
 
-Almost everything is also available by voice — moderation, music, memory,
+Almost everything is also available by voice — moderation, memory,
 search and images are all tools the model can call. The slash commands are just
 a direct route to the common ones.
 
@@ -239,34 +237,6 @@ the room is mid-conversation, so it's a nudge rather than an announcement — bu
 it *is* the model's judgement, so expect it to occasionally chime in when you'd
 rather it didn't. Raise the cooldown or turn it off if it grates.
 
-## Music
-
-Ask by voice — "play some lofi", "put on Groove Salad", "skip this", "turn the
-music down" — or use `/play`, `/stop`, `/skip`.
-
-Three kinds of source:
-
-| Source | Example |
-| --- | --- |
-| Local files | drop audio in `music/`, then "play <filename>" |
-| Radio stations | `lofi`, `chillhop`, `jazz`, `groove`, `synth`, `metal` |
-| Direct audio links | any URL that points at an actual audio file |
-
-Music is mixed into the same stream the bot speaks through, and **ducks to 20%
-while it talks** — measured at 22% of full volume during speech, recovering to
-98% afterwards. The gain eases rather than jumping, so there's no click, and it
-holds through the gaps between words instead of surging back mid-sentence.
-
-Decoding uses a bundled ffmpeg (`ffmpeg-static`), so there's nothing to install
-separately. Tune with `MUSIC_VOLUME` and `MUSIC_DUCK`.
-
-### No YouTube
-
-YouTube links are refused, with an explanation rather than a silent failure.
-Extracting audio from YouTube breaks their terms of service — it's what got
-Groovy and Rythm shut down by Google — and the scraping libraries that do it
-break every few weeks when YouTube changes its player. Local files, radio
-streams and direct links don't have either problem.
 
 ## Web search
 
@@ -290,6 +260,30 @@ channel keeps the readable version you can click later.
 
 On by default. `WEB_SEARCH=0` disables it, which also reduces free-tier usage.
 
+## Catching up on what you missed
+
+The bot sits in the channel for hours and knows who said what. That record is
+kept for a short window so anyone can ask:
+
+```
+"spongebob, what did I miss?"       -> summary of the last 30 minutes
+"what did we decide about ranked?"  -> finds where it was discussed
+"did anyone mention my name?"       -> searches the conversation
+```
+
+Lines are attributed by speaker and timestamped, so the summary says who said
+what rather than blurring everyone together.
+
+**It is a record, so it is disclosed.** `/join` announces in the channel that a
+short record is kept, for how long, and that it's cleared on leave. It lives in
+memory only, is never written to disk, and is discarded when the bot leaves or
+after `TRANSCRIPT_RETAIN_MIN` (2 hours). `TRANSCRIPT=0` turns it off entirely.
+
+| Tool | What it does |
+| --- | --- |
+| `catch_up` | Summarises the last N minutes of conversation |
+| `search_conversation` | Finds where a topic or name came up |
+
 ## Memory and reminders
 
 Ask it to remember something and it will, across restarts:
@@ -310,7 +304,14 @@ Ask it to remember something and it will, across restarts:
 | `get_current_time` | So "8am tomorrow" resolves to the right day |
 
 Reminders are delivered in the text channel with an @mention *and* spoken aloud
-if a call is live. Everything is written to `memory-store.json` immediately —
+if a call is live.
+
+**Notes are private to whoever saved them.** `recall_memory` and
+`forget_memory` filter by the speaker, so one person's saved number is never
+read out to somebody else in the channel — several people share this bot and
+the same voice channel, so a shared pool would leak by default.
+
+Everything is written to `memory-store.json` immediately —
 a reminder that vanishes on restart is worse than no reminder, because someone
 is relying on it. Anything that came due while the bot was offline is delivered
 late rather than dropped, labelled with how late it is.
@@ -319,10 +320,10 @@ late rather than dropped, labelled with how late it is.
 "8am tomorrow" becomes a guess; with it, the model converts to a real timestamp
 and the code rejects anything already in the past.
 
-**On privacy:** memories are stored as plain text in `memory-store.json`
-(gitignored) and are shared per-server — anyone in the same guild can recall
-what anyone else saved. That's usually what you want for "remind us about the
-raid", and not what you want for passwords. Don't store secrets in it.
+**On privacy:** each person only ever sees their own notes — `recall_memory`
+and `forget_memory` filter by the speaker, so one person's saved number is
+never read out to someone else. The file itself is plain text on disk
+(gitignored), so it is private between people, not encrypted against you.
 
 ## Anime images (waifu.im)
 
@@ -369,6 +370,28 @@ gating applies to both providers identically.
 
 If waifu.im ever becomes reachable for you — their Discord can allowlist a
 token — set `WAIFU_PROVIDER=waifu.im` to get the full tag set back.
+
+## Server administration
+
+Everything an admin can do in the Discord UI, by voice — in
+[src/admin-tools.js](src/admin-tools.js):
+
+| Tool | Required permission |
+| --- | --- |
+| `kick_member` | Kick Members |
+| `ban_member` · `unban_member` · `list_bans` | Ban Members |
+| `set_nickname` | Manage Nicknames |
+| `manage_channel` (create/delete/rename) | Manage Channels |
+| `set_slowmode` · `lock_channel` | Manage Channels |
+| `manage_server_role` (create/delete) | Manage Roles |
+| `mute_everyone` | Mute Members |
+| `move_everyone` | Move Members |
+| `server_info` · `member_info` | none (read-only) |
+
+The same rule applies as everywhere else: **the speaker's permissions decide**,
+not the bot's. Administrator on the bot means it *can* carry an action out, not
+that anyone may ask for it. Role hierarchy is enforced for both parties, and
+kick/ban/delete go through the two-step confirmation.
 
 ## Voice moderation
 
@@ -439,26 +462,6 @@ outright. Left unset, the bot runs normally and only this one tool is
 unavailable. Nothing is reported for members who are invisible or who hide
 their activity.
 
-### Spoken profanity filter
-
-Off by default. Set `PROFANITY_FILTER=1` to enable: first offence gets a spoken
-warning, the next gets an automatic server mute that lifts itself after
-`PROFANITY_MUTE_MIN` minutes. Strikes reset after `PROFANITY_DECAY_MIN` minutes
-of clean speech, so one slip doesn't follow someone around all night.
-
-Customise the word list in `profanity.txt` (one word per line, `#` for comments)
-or via `PROFANITY_WORDS`. The built-in default is deliberately small.
-
-Matching folds case, padding ("fuuuck"), and symbol substitution ("sh!t"), and
-is whole-word — "Scunthorpe", "assassin", "shiitake" and "pass" don't trigger it.
-
-**The important limitation:** this punishes automatically, with nobody
-reviewing it. Two things can go wrong — speech-to-text mishears, and with
-several people talking the transcript can't be pinned to one speaker. So
-enforcement only runs when **exactly one person spoke during that turn**;
-overlapping voices are skipped and logged. It also can't tell a slur from a
-quotation or someone discussing the word. Run it with `MOD_DRY_RUN=1` for a
-while and read the log before letting it mute anyone for real.
 
 ## Free tier notes
 
