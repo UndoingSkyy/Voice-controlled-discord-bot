@@ -21,15 +21,37 @@ const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
 if (process.env.ENABLE_PRESENCE === '1') {
   intents.push(GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMembers);
 }
+const WELCOME_FIRST_TEXT = process.env.WELCOME_TEXT_FIRST !== '0';
+if (process.env.READ_MESSAGES === '1' || WELCOME_FIRST_TEXT) {
+  intents.push(GatewayIntentBits.GuildMessages);
+}
 if (process.env.READ_MESSAGES === '1') {
-  // MessageContent is privileged too: without it every message arrives blank.
-  intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+  // MessageContent is privileged: needed to read and speak message text.
+  intents.push(GatewayIntentBits.MessageContent);
 }
 if (process.env.WELCOME_VOICE === '1' && !intents.includes(GatewayIntentBits.GuildMembers)) {
   intents.push(GatewayIntentBits.GuildMembers); // needed for guildMemberAdd
 }
 
 const client = new Client({ intents });
+const TEXT_WELCOME_COOLDOWN_MS = Number(process.env.TEXT_WELCOME_COOLDOWN_MIN ?? 60) * 60_000;
+const textWelcomeCooldown = new Map(); // guild:channel:user -> last welcome time
+
+function maybeWelcomeFirstTextMessage(message) {
+  if (!WELCOME_FIRST_TEXT) return;
+  if (!message.guildId || message.author?.bot || message.system) return;
+  if (!message.channel?.isTextBased?.() || message.channel.isDMBased?.()) return;
+
+  const key = `${message.guildId}:${message.channelId}:${message.author.id}`;
+  const last = textWelcomeCooldown.get(key) ?? 0;
+  const now = Date.now();
+  if (now - last < TEXT_WELCOME_COOLDOWN_MS) return;
+
+  textWelcomeCooldown.set(key, now);
+  message.channel
+    .send(`Welcome <@${message.author.id}>! Glad to see your first message here.`)
+    .catch(() => {});
+}
 
 /**
  * A malformed voice packet arrives on a UDP callback, so anything thrown there
@@ -79,8 +101,10 @@ client.on(Events.PresenceUpdate, (oldPresence, newPresence) => {
 
 // Read messages typed in the /join channel out loud.
 client.on(Events.MessageCreate, (message) => {
-  if (process.env.READ_MESSAGES !== '1' || !message.guildId) return;
-  getSession(message.guildId)?.speakMessage(message);
+  maybeWelcomeFirstTextMessage(message);
+  if (process.env.READ_MESSAGES === '1' && message.guildId) {
+    getSession(message.guildId)?.speakMessage(message);
+  }
 });
 
 // Greet people arriving in the bot's voice channel.

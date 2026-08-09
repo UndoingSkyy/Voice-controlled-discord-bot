@@ -12,6 +12,7 @@ import prism from 'prism-media';
 import { EmbedBuilder } from 'discord.js';
 
 import { GeminiLiveSession } from './gemini-live.js';
+import { HybridSession } from './hybrid-backend.js';
 import {
   SpeakerStream,
   SpeechGate,
@@ -196,8 +197,15 @@ const READ_MIN_GAP_MS = Number(process.env.READ_MIN_GAP_SEC ?? 2) * 1000;
 const READ_MAX_CHARS = Number(process.env.READ_MAX_CHARS ?? 300);
 const WELCOME_COOLDOWN_MS = Number(process.env.WELCOME_COOLDOWN_MIN ?? 5) * 60_000;
 
-/** Google Search grounding. On by default: it needs no extra key or quota. */
-const WEB_SEARCH = process.env.WEB_SEARCH !== '0';
+/**
+ * Which backend runs the conversation.
+ *   live   — Gemini Live: one socket, native speech-to-speech, lowest latency
+ *   hybrid — local Parakeet + Gemini text + local Kokoro; far more quota room
+ */
+const BACKEND = (process.env.BACKEND || 'live').toLowerCase();
+
+/** Google Search grounding — a Live API feature; not available on hybrid. */
+const WEB_SEARCH = process.env.WEB_SEARCH !== '0' && BACKEND !== 'hybrid';
 
 const SEARCH_INSTRUCTION = `
 You can search the web. Use it whenever someone asks you to look something up,
@@ -471,12 +479,14 @@ class VoiceSession {
 
   /** Open a Live session, resuming the previous conversation when possible. */
   async #connectGemini() {
-    this.gemini = new GeminiLiveSession({
+    const opts = {
       functionDeclarations: moderationDeclarations,
       extraInstruction: this.#instructions(),
       resumeHandle: this.#resumeHandle,
       enableSearch: WEB_SEARCH,
-    });
+    };
+
+    this.gemini = BACKEND === 'hybrid' ? new HybridSession(opts) : new GeminiLiveSession(opts);
     this.#wireGemini();
     await this.gemini.connect(this.#resumeHandle);
 

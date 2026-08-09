@@ -121,6 +121,19 @@ export const adminDeclarations = [
     description: 'Details about a member: roles, join date, account age, timeout status.',
     parameters: obj({ target: S('Member to look up') }, ['target']),
   },
+  {
+    name: 'write_channel_message',
+    description:
+      'Write a message in a text channel as the bot, prefixed with the requester name. ' +
+      'Use this when asked to post something in chat.',
+    parameters: obj(
+      {
+        message: S('The message to send'),
+        channel: S('Optional channel name or ID. Defaults to the current text channel.'),
+      },
+      ['message'],
+    ),
+  },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -366,5 +379,25 @@ export const adminHandlers = {
       timed_out_until: m.communicationDisabledUntil?.toLocaleString() ?? null,
       is_owner: m.id === ctx.guild.ownerId,
     };
+  },
+
+  async write_channel_message(ctx, { message, channel }) {
+    const { assertPermission } = ctx.helpers;
+    const body = String(message ?? '').trim();
+    if (!body) throw new Error('Give me a message to send.');
+
+    const raw = String(channel ?? '').trim();
+    const byId = raw ? ctx.guild.channels.cache.get(raw.replace(/[<#>]/g, '')) : null;
+    const ch = byId ?? findChannel(ctx, raw);
+    const target = ch ?? ctx.textChannel;
+
+    if (!target?.isTextBased?.() || target.isVoiceBased?.()) {
+      throw new Error('That is not a text channel I can write in.');
+    }
+    assertPermission(ctx, P.SendMessages, 'Send Messages', target);
+
+    const who = ctx.requester?.displayName ?? ctx.requester?.user?.username ?? 'Unknown';
+    if (!DRY_RUN) await target.send(`${who}: ${body}`.slice(0, 1900));
+    return { done: `Sent message in #${target.name}` };
   },
 };
