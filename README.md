@@ -1,7 +1,11 @@
-# Discord ↔ Gemini real-time voice bot
+# Earshot
 
-Talk to Gemini out loud in a Discord voice channel. It listens, thinks, and answers
-in a natural voice — no push-to-talk, and you can interrupt it mid-sentence.
+A Discord bot that stays within earshot of your voice channel: it listens, answers
+out loud, and moderates on command — no push-to-talk, and you can interrupt it
+mid-sentence.
+
+Powered by the Gemini Live API. Say its name and ask a question, or tell it to mute
+someone, and it does it.
 
 ## How it works
 

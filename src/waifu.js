@@ -11,7 +11,7 @@ import { Type } from '@google/genai';
  */
 
 const BASE = 'https://api.waifu.im';
-const UA = 'discord-gemini-voice-bot/1.0';
+const UA = 'earshot/1.0';
 const PREFS_FILE = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   '..',

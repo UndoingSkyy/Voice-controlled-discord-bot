@@ -1,9 +1,9 @@
 {
-  "name": "discord-gemini-voice-bot",
+  "name": "earshot",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Real-time voice chat in Discord powered by the Google Gemini Live API, with voice-driven moderation, memory and search",
+  "description": "Earshot — a real-time voice bot for Discord: talk to it, and moderate your server by voice. Powered by the Google Gemini Live API.",
   "main": "src/index.js",
   "keywords": [
     "discord",
