@@ -91,60 +91,6 @@ Almost everything is also available by voice — moderation, memory,
 search and images are all tools the model can call. The slash commands are just
 a direct route to the common ones.
 
-## Backends
-
-`BACKEND` picks how the conversation runs. Everything else — moderation,
-memory, catch-up, images, the noise gate, speaker labels — is identical either
-way, because both backends expose the same interface.
-
-| | `live` (default) | `hybrid` |
-| --- | --- | --- |
-| Shape | one WebSocket, speech in and out | local STT → Gemini text → local TTS |
-| Quota bucket | Live API (small, easily exhausted) | `generateContent` (much roomier) |
-| Latency | ~775 ms to first audio | ~1 s for the model, plus local STT/TTS |
-| Tone and interruption | native, handles barge-in itself | reconstructed locally |
-| Web search grounding | yes | no |
-| Runs without your PC | yes | no — the local services must be up |
-
-The hybrid exists for one reason: every quota failure in practice has been on
-the Live API's `bidiGenerateContent`, which has a far smaller free-tier budget
-than plain text generation. Moving speech in and out onto your machine leaves
-only a short text request per turn.
-
-### Setting up hybrid
-
-```bash
-npm run test:hybrid
-```
-
-That checks all three legs separately and says which one is not ready.
-
-**Speech-to-text — Parakeet** (`parakeet/`, a Go server). Needs building, ONNX
-Runtime, and the model downloaded into `parakeet/models/`; see its README. It
-serves an OpenAI Whisper-compatible API, so `STT_URL` can point at any server
-speaking that dialect instead.
-
-**Text-to-speech — Kokoro.** Two options:
-
-- `TTS_MODE=openai` (default) expects `POST /v1/audio/speech`, which is what
-  **kokoro-fastapi** serves on port 8880. This is the more reliable route.
-- `TTS_MODE=gradio` with `TTS_URL=http://localhost:7860` talks to the Pinokio
-  Kokoro-TTS app in `Kokoro-TTS.git/`. That app is a UI first, so its API is a
-  two-step submit-then-poll protocol whose shape moves between Gradio versions.
-
-**Model choice matters more than you would expect.** Measured with all 34 tools:
-
-| Model | Time | Tool call |
-| --- | --- | --- |
-| `gemini-flash-lite-latest` | **~1.0 s** | correct |
-| `gemini-flash-latest` | ~10.8 s | correct |
-| `gemini-3-flash-preview` | ~12.4 s | correct |
-
-The larger models reason internally before answering, which is invisible and
-costs ten seconds in a voice conversation. flash-lite scored **7/7** on tool
-selection (mute, kick, catch-up, remember, reminder, move, plain question) at a
-median of 978 ms, so it is the default.
-
 ## Response latency
 
 Measured time from asking to the first audio byte:

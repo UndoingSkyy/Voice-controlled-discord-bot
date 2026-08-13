@@ -12,7 +12,6 @@ import prism from 'prism-media';
 import { EmbedBuilder } from 'discord.js';
 
 import { GeminiLiveSession } from './gemini-live.js';
-import { HybridSession } from './hybrid-backend.js';
 import {
   SpeakerStream,
   SpeechGate,
@@ -186,26 +185,55 @@ const DEFAULT_LANGUAGE = ['hindi', 'english', 'auto'].includes(BOT_LANGUAGE)
  * `WAKE_WORD=off` disables the gate and answers everything.
  */
 const WAKE_WORD_SETTING = (process.env.WAKE_WORD ?? '').trim();
-/** Hard playback gate. Off by default — the model decides if it was addressed. */
+/**
+ * Hard playback gate. Off by default: the model is told its name and told to
+ * stay quiet unless addressed, and it judges that better than a string match
+ * can — speech recognition mangles names, and a missed match means the bot
+ * goes silent for no reason the room can see.
+ *
+ * WAKE_STRICT=1 refuses to speak unless the name was literally recognised.
+ * Quieter in a busy channel, but it will swallow real questions.
+ */
 const WAKE_STRICT = process.env.WAKE_STRICT === '1';
 
-/** After being addressed, keep replying this long so follow-ups feel natural. */
+/**
+ * After being addressed, keep replying this long so follow-ups need no name.
+ * Set WAKE_FOLLOWUP_SEC=0 to require the name in every single sentence.
+ */
 const FOLLOW_UP_MS = Number(process.env.WAKE_FOLLOWUP_SEC ?? 45) * 1000;
+
+/**
+ * Picking up a sentence someone talked over. The model keeps its own cancelled
+ * turn in context, so this only has to tell it what to do about it — no need to
+ * feed the text back, which would commit a turn and cut the speaker off.
+ */
+const RESUME_INSTRUCTION = `
+If someone talks over you and you never finished what you were saying, pick it
+back up the next time they speak to you: start with "As I was saying" and
+complete the thought in one short sentence. Only do this if they still want it —
+if they changed the subject, interrupted to correct you, or asked something new,
+drop the old thread entirely and answer what they actually asked. Never resume
+more than once, and never replay a sentence you already finished.`.trim();
+
+/**
+ * How much reply audio to hold while waiting to hear the name. 24 kHz mono
+ * 16-bit is 48 KB/s, so this is a few seconds — enough to cover transcription
+ * lag without letting an unaddressed reply pile up in memory.
+ */
+const HOLD_MAX_BYTES = 48_000 * 4;
+
+/**
+ * Mirror every spoken exchange into the text channel. Off: it floods the
+ * channel and nobody reads it. Set ECHO_TO_CHANNEL=1 to get it back.
+ */
+const ECHO_TO_CHANNEL = process.env.ECHO_TO_CHANNEL === '1';
 
 /** Reading typed messages aloud: pacing and length limits. */
 const READ_MIN_GAP_MS = Number(process.env.READ_MIN_GAP_SEC ?? 2) * 1000;
 const READ_MAX_CHARS = Number(process.env.READ_MAX_CHARS ?? 300);
 const WELCOME_COOLDOWN_MS = Number(process.env.WELCOME_COOLDOWN_MIN ?? 5) * 60_000;
 
-/**
- * Which backend runs the conversation.
- *   live   — Gemini Live: one socket, native speech-to-speech, lowest latency
- *   hybrid — local Parakeet + Gemini text + local Kokoro; far more quota room
- */
-const BACKEND = (process.env.BACKEND || 'live').toLowerCase();
-
-/** Google Search grounding — a Live API feature; not available on hybrid. */
-const WEB_SEARCH = process.env.WEB_SEARCH !== '0' && BACKEND !== 'hybrid';
+const WEB_SEARCH = process.env.WEB_SEARCH !== '0';
 
 const SEARCH_INSTRUCTION = `
 You can search the web. Use it whenever someone asks you to look something up,
@@ -261,18 +289,37 @@ function mentionsWakeWord(text, wake) {
   const want = fold(wake).trim();
   if (!want) return false;
   const haystack = fold(text);
-  if (haystack.includes(want)) return true;
+  // Whole words only. A bare `includes` fires on "sponges in the ocean" for a
+  // bot called Sponge, and in strict mode a false wake means it talks over
+  // a conversation it was never part of.
+  const boundary = new RegExp(`(?:^|\\s)${want.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s|$)`);
+  if (boundary.test(haystack)) return true;
 
   // Run-together names get spoken — and transcribed — as separate words:
-  // "spongebob" is heard as "sponge bob". Compare with spacing removed.
-  const squashed = haystack.replace(/\s+/g, '');
+  // "spongebob" is heard as "sponge bob". Join neighbouring words and compare
+  // whole, rather than squashing the sentence flat — flattening loses the word
+  // boundaries too, so "sponges in the" would match a bot called Sponge.
   const wantSquashed = want.replace(/\s+/g, '');
-  if (wantSquashed.length >= 5 && squashed.includes(wantSquashed)) return true;
+  const words = haystack.split(/\s+/).filter(Boolean);
+  if (wantSquashed.length >= 5) {
+    for (let i = 0; i < words.length; i++) {
+      let joined = '';
+      for (let n = 0; n < 3 && i + n < words.length; n++) {
+        joined += words[i + n];
+        if (joined === wantSquashed) return true;
+        if (joined.length > wantSquashed.length) break;
+      }
+    }
+  }
 
   // Compare word by word so "Kamia"/"Camiya" still count.
   const target = want.replace(/ /g, '');
   return haystack.split(/\s+/).some((tok) => {
     if (!tok || Math.abs(tok.length - target.length) > 1) return false;
+    // "sponges" is one edit from "sponge", but it is a different word, not a
+    // mangled transcription. Inflections are the common case for a name that
+    // is also an ordinary noun, so spend the edit anywhere but the end.
+    if (tok.length > target.length && tok.startsWith(target)) return false;
     let edits = 0, i = 0, j = 0;
     while (i < tok.length && j < target.length) {
       if (tok[i] === target[j]) { i++; j++; continue; }
@@ -319,6 +366,8 @@ class VoiceSession {
   #lastSpeaker = null; // { id, at } — who a tool call is attributed to
   #turnSpeakers = new Set(); // everyone who spoke during the current turn
   #respondUntil = 0; // replies are played while now() is below this
+  #addressed = false; // the name was heard during the current turn
+  #held = []; // reply audio waiting on the name to be recognised
   #floor = null; // { userId, at } — whose audio is currently being forwarded
   #labelled = null; // userId we last announced to the model
   #lastActivityPing = new Map(); // userId -> when we last commented on them
@@ -451,6 +500,7 @@ class VoiceSession {
       languageInstruction(this.#language),
       STYLE_INSTRUCTION,
       MULTI_SPEAKER_INSTRUCTION,
+      RESUME_INSTRUCTION,
       NARRATION_INSTRUCTION,
       MODERATION_INSTRUCTION,
     ];
@@ -463,11 +513,19 @@ class VoiceSession {
           (rest.length ? ` People also shorten it to: ${rest.join(', ')}.` : '') +
           ` Speech recognition mangles names, so anything close to those — a ` +
           `similar-sounding word at the start of a sentence — is probably you.\n\n` +
-          `Several people share this channel. Answer when someone is talking TO ` +
-          `you: they said your name, asked you a question, gave you an ` +
-          `instruction, or is continuing a conversation with you. When in doubt ` +
-          `about a direct question or a command, answer it — a missed request is ` +
-          `worse than one extra reply.\n\n` +
+          (WAKE_STRICT
+            ? `Several people share this channel and most of what you hear is ` +
+              `not for you. Answer ONLY when this sentence is addressed to you ` +
+              `by name, or is a direct follow-up to something you just said. ` +
+              `If your name is not in it and you are not already mid-` +
+              `conversation with that person, say nothing at all. When in ` +
+              `doubt, stay silent — an extra reply over someone else's ` +
+              `conversation is worse than a missed one.\n\n`
+            : `Several people share this channel. Answer when someone is ` +
+              `talking TO you: they said your name, asked you a question, gave ` +
+              `you an instruction, or is continuing a conversation with you. ` +
+              `When in doubt about a direct question or a command, answer it — ` +
+              `a missed request is worse than one extra reply.\n\n`) +
           `Stay quiet when people are clearly talking to each other: chatter about ` +
           `the game, side conversations, someone answering someone else. Do not ` +
           `narrate, do not join in uninvited, and never answer a question ` +
@@ -486,7 +544,7 @@ class VoiceSession {
       enableSearch: WEB_SEARCH,
     };
 
-    this.gemini = BACKEND === 'hybrid' ? new HybridSession(opts) : new GeminiLiveSession(opts);
+    this.gemini = new GeminiLiveSession(opts);
     this.#wireGemini();
     await this.gemini.connect(this.#resumeHandle);
 
@@ -586,22 +644,36 @@ class VoiceSession {
   /**
    * Should the bot be heard right now?
    *
-   * By default: yes. The model is told its name and told to stay quiet unless
-   * addressed, and it judges that far better than a string match can — speech
-   * recognition mangles names constantly, and a missed match means the bot goes
-   * silent for no reason the room can see.
-   *
-   * WAKE_STRICT=1 restores the hard gate: nothing is played unless the name was
-   * literally recognised. Quieter, but it will swallow real questions.
+   * With WAKE_STRICT on (the default) nothing is played unless the name was
+   * actually recognised, so it cannot talk over a conversation it is not part
+   * of. Set WAKE_STRICT=0 to let the model judge instead — it is told its name
+   * and told to stay quiet unless addressed, which is friendlier but does speak
+   * up uninvited in a busy channel.
    */
   get #awake() {
     if (!WAKE_STRICT || !this.wakeWords.length) return true;
-    return Date.now() < this.#respondUntil;
+    // The name landing in *this* turn always counts, so WAKE_FOLLOWUP_SEC=0
+    // still works — it just means every sentence has to say the name.
+    return this.#addressed || Date.now() < this.#respondUntil;
+  }
+
+  #heldBytes() {
+    return this.#held.reduce((n, b) => n + b.length, 0);
+  }
+
+  /** Play everything that was buffered while we waited to hear the name. */
+  #flushHeld() {
+    if (!this.#held.length) return;
+    const queued = this.#held;
+    this.#held = [];
+    for (const pcm of queued) this.speaker.write(pcm24MonoTo48Stereo(pcm));
   }
 
   /** Let the bot speak for this exchange and any quick follow-up. */
   #wake() {
+    this.#addressed = true;
     this.#respondUntil = Date.now() + FOLLOW_UP_MS;
+    this.#flushHeld();
   }
 
   #wireGemini() {
@@ -616,11 +688,25 @@ class VoiceSession {
       // Gemini answers everything it hears; when it wasn't addressed we simply
       // never play the reply. The audio is already generated either way — this
       // gates the room, not the API usage.
-      if (!this.#awake) return;
+      //
+      // The reply can start arriving before the transcription of what was said
+      // does, so "not awake yet" is not the same as "not for us". Hold the
+      // audio instead of dropping it: if the name turns up later in the same
+      // turn it still gets played, and if it never does, turnComplete bins it.
+      if (!this.#awake) {
+        this.#held.push(pcm24);
+        while (this.#heldBytes() > HOLD_MAX_BYTES) this.#held.shift();
+        return;
+      }
+      this.#flushHeld();
       this.speaker.write(pcm24MonoTo48Stereo(pcm24));
     });
 
-    this.gemini.on('interrupted', () => this.speaker.clear());
+    this.gemini.on('interrupted', () => {
+      if (stale()) return;
+      this.speaker.clear();
+      this.#held = [];
+    });
 
     this.gemini.on('text', (chunk, who) => {
       if (stale()) return;
@@ -653,6 +739,10 @@ class VoiceSession {
 
       const heard = this.#awake;
       if (!heard) this.speaker.clear(); // drop anything that slipped through
+      this.#held = []; // never addressed: the buffered reply is discarded
+      // The name has to be said again next turn, unless the follow-up window
+      // is still open.
+      this.#addressed = false;
 
       const grounding = this.#grounding;
       this.#grounding = null;
@@ -666,11 +756,18 @@ class VoiceSession {
         return;
       }
 
-      const lines = [];
-      if (user.trim()) lines.push(`🗣️ **You:** ${user.trim()}`);
-      if (heard && model.trim()) lines.push(`🤖 **Gemini:** ${model.trim()}`);
-      if (lines.length) {
-        this.textChannel.send(lines.join('\n').slice(0, 1900)).catch(() => {});
+      // Nothing routine is posted to the channel. Mirroring every exchange
+      // turns a busy voice call into an unreadable wall of text, and the same
+      // record is already kept in memory for "what did I miss?". Only things
+      // that need to be read later — search results, images, links — get
+      // posted, and those have their own paths.
+      if (ECHO_TO_CHANNEL) {
+        const lines = [];
+        if (user.trim()) lines.push(`🗣️ **You:** ${user.trim()}`);
+        if (heard && model.trim()) lines.push(`🤖 **Gemini:** ${model.trim()}`);
+        if (lines.length) {
+          this.textChannel.send(lines.join('\n').slice(0, 1900)).catch(() => {});
+        }
       }
     });
 

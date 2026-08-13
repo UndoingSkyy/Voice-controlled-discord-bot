@@ -13,19 +13,32 @@ import * as transcript from './transcript.js';
  * while the bot was down are delivered late rather than dropped.
  */
 
-const STORE = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '..',
-  'memory-store.json',
-);
+const STORE = process.env.MEMORY_STORE
+  ? path.resolve(process.env.MEMORY_STORE)
+  : path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'memory-store.json');
 
 /** How often to check for due reminders. */
-const TICK_MS = 20_000;
+const TICK_MS = Math.min(
+  Math.max(Number(process.env.REMINDER_POLL_MS ?? 1_000), 250),
+  60_000,
+);
 
 function load() {
   try {
     const data = JSON.parse(fs.readFileSync(STORE, 'utf8'));
-    return Array.isArray(data.entries) ? data : { entries: [] };
+    if (!Array.isArray(data.entries)) return { entries: [] };
+    // Older versions marked delivered reminders but never removed them.
+    // Treat those stale one-shot records as already completed during startup.
+    const entries = data.entries.filter((entry) => !(entry.remindAt && entry.delivered));
+    if (entries.length !== data.entries.length) {
+      try {
+        fs.writeFileSync(STORE, JSON.stringify({ entries }, null, 2));
+        console.log('[memory] removed stale delivered reminders');
+      } catch (err) {
+        console.error('[memory] could not clean stale reminders:', err.message);
+      }
+    }
+    return { entries };
   } catch {
     return { entries: [] };
   }
@@ -76,6 +89,36 @@ const describe = (e) => ({
 /* ------------------------------------------------------------------ */
 
 let timer = null;
+const delivering = new Set();
+
+/** Parse values such as "2min", "2hr", "2 days", or "1h 30m". */
+export function parseReminderDuration(value) {
+  const text = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^in\s+/, '')
+    .replace(/,/g, ' ');
+  if (!text) return null;
+
+  const units = {
+    s: 1_000, sec: 1_000, secs: 1_000, second: 1_000, seconds: 1_000,
+    m: 60_000, min: 60_000, mins: 60_000, minute: 60_000, minutes: 60_000,
+    h: 3_600_000, hr: 3_600_000, hrs: 3_600_000, hour: 3_600_000, hours: 3_600_000,
+    d: 86_400_000, day: 86_400_000, days: 86_400_000,
+    w: 604_800_000, week: 604_800_000, weeks: 604_800_000,
+  };
+  const pattern = /(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|hr|h|days?|d|weeks?|w)\b/g;
+  let total = 0;
+  let match;
+  while ((match = pattern.exec(text))) total += Number(match[1]) * units[match[2]];
+
+  if (!total && /^\d+(?:\.\d+)?$/.test(text)) total = Number(text) * 60_000;
+  if (!total) return null;
+
+  const remainder = text.replace(pattern, '').replace(/\s+/g, ' ').trim();
+  if (remainder && !/^\d+(?:\.\d+)?$/.test(text)) return null;
+  return total;
+}
 
 /**
  * Poll for due reminders. Polling rather than one timer per reminder keeps
@@ -84,25 +127,42 @@ let timer = null;
 export function startReminderLoop(client, getSession) {
   if (timer) return;
 
-  const tick = async () => {
-    const now = Date.now();
-    const due = db.entries.filter((e) => e.remindAt && !e.delivered && e.remindAt <= now);
-    if (!due.length) return;
-
-    for (const entry of due) {
-      entry.delivered = true; // mark first, so a failure can't cause a loop
-      try {
-        await deliver(client, getSession, entry, now);
-      } catch (err) {
-        console.error(`[memory] failed to deliver reminder ${entry.id}:`, err.message);
-      }
-    }
-    save(db);
-  };
+  const tick = () => deliverDueReminders(client, getSession);
 
   timer = setInterval(tick, TICK_MS);
   timer.unref?.();
   setTimeout(tick, 2_000).unref?.(); // catch anything missed while offline
+}
+
+async function deliverDueReminders(client, getSession, now = Date.now()) {
+  const due = db.entries.filter(
+    (e) => e.remindAt && !e.delivered && e.remindAt <= now && !delivering.has(e.id),
+  );
+  if (!due.length) return 0;
+
+  let cleared = 0;
+  for (const entry of due) {
+    delivering.add(entry.id);
+    try {
+      await deliver(client, getSession, entry, now);
+      // Reminders are one-shot. Remove them after delivery so they cannot
+      // reappear after restart or accumulate as delivered records.
+      db.entries = db.entries.filter((candidate) => candidate.id !== entry.id);
+      save(db);
+      cleared += 1;
+      console.log(`[memory] cleared reminder ${entry.id}`);
+    } catch (err) {
+      console.error(`[memory] failed to deliver reminder ${entry.id}:`, err.message);
+    } finally {
+      delivering.delete(entry.id);
+    }
+  }
+  return cleared;
+}
+
+/** Test seam for the one-shot delivery behavior. */
+export function _runReminderTickForTests(client, getSession, now = Date.now()) {
+  return deliverDueReminders(client, getSession, now);
 }
 
 async function deliver(client, getSession, entry, now) {
@@ -177,13 +237,18 @@ export const memoryDeclarations = [
   {
     name: 'set_reminder',
     description:
-      'Remember something AND say it out loud at a given time. Give either in_minutes ' +
-      'for relative times ("in an hour") or at_iso for clock times — call get_current_time ' +
-      'first so you compute the right day.',
+      'Remember something and say it out loud once. For relative times, put the exact ' +
+      'spoken duration in after, such as "2min", "2hr", or "2 days". Do not convert it ' +
+      'yourself. Use at_iso only for a clock or calendar time.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         content: { type: Type.STRING, description: 'What to remind them about' },
+        after: {
+          type: Type.STRING,
+          description:
+            'Exact relative duration as spoken, e.g. "2min", "2hr", "2 days", or "1 hour 30 minutes"',
+        },
         in_minutes: { type: Type.NUMBER, description: 'Minutes from now' },
         at_iso: {
           type: Type.STRING,
@@ -291,11 +356,14 @@ export const memoryHandlers = {
     return { done: `Remembered: ${entry.content}` };
   },
 
-  set_reminder(ctx, { content, in_minutes, at_iso }) {
+  set_reminder(ctx, { content, after, in_minutes, at_iso }) {
     if (!content?.trim()) throw new Error('There is nothing to remind you about.');
 
     let remindAt;
-    if (Number.isFinite(Number(in_minutes)) && in_minutes !== undefined && in_minutes !== null) {
+    const durationMs = parseReminderDuration(after);
+    if (durationMs !== null) {
+      remindAt = Date.now() + durationMs;
+    } else if (Number.isFinite(Number(in_minutes)) && in_minutes !== undefined && in_minutes !== null) {
       const mins = Number(in_minutes);
       if (mins <= 0) throw new Error('That time is in the past.');
       remindAt = Date.now() + mins * 60_000;
@@ -308,7 +376,7 @@ export const memoryHandlers = {
         );
       }
     } else {
-      throw new Error('Tell me when: either in_minutes or at_iso.');
+      throw new Error('Tell me when, for example "in 2min", "in 2hr", or "in 2 days".');
     }
 
     if (remindAt - Date.now() > 365 * 24 * 60 * 60_000) {
@@ -329,7 +397,9 @@ export const memoryHandlers = {
     };
     db.entries.push(entry);
     save(db);
-    return { done: `Reminder set for ${new Date(remindAt).toLocaleString()}: ${entry.content}` };
+    return {
+      done: `Reminder set for ${new Date(remindAt).toLocaleString()} and it will be cleared after delivery: ${entry.content}`,
+    };
   },
 
   /**
@@ -402,4 +472,8 @@ export const memoryHandlers = {
 /** Test seam — lets a test point the store somewhere disposable. */
 export function _resetForTests(entries = []) {
   db = { entries };
+}
+
+export function _getEntriesForTests() {
+  return db.entries;
 }

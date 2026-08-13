@@ -559,6 +559,10 @@ const DESTRUCTIVE = {
   delete_messages: (a) =>
     `delete the last ${a.count} message(s)${a.from_member ? ` from ${a.from_member}` : ''}`,
   disconnect_member: (a) => `disconnect ${a.target} from voice`,
+  // A deleted emoji cannot be restored, and a cancelled event loses everyone
+  // who had signed up for it.
+  manage_emoji: (a) => (String(a.action).toLowerCase().startsWith('delete') ? `delete the emoji "${a.name}"` : null),
+  manage_event: (a) => (String(a.action).toLowerCase().startsWith('cancel') ? `cancel the event "${a.name}"` : null),
   timeout_member: (a) =>
     Number(a.minutes) > 0 ? `time ${a.target} out for ${a.minutes} minute(s)` : null,
   // Someone may be relying on a stored number or reminder; deleting it silently
@@ -634,6 +638,8 @@ export async function executeTool(name, args, ctx) {
     'list_members', 'list_channels', 'list_waifu_tags', 'send_waifu_image',
     'get_current_time', 'catch_up', 'search_conversation', 'server_info', 'member_info', 'list_bans', 'set_reply_language',
   ].includes(name);
+  // read_channel_messages, audit_log and the list actions are read-only too,
+  // but they still name people, so they keep the identity requirement.
   if (NEEDS_IDENTITY && !ctx.requester) {
     return { error: "I couldn't tell who asked, so I won't run that command." };
   }

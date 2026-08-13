@@ -11,6 +11,7 @@ bot.err
 
 # Data the bot writes at runtime
 memory-store.json
+tests/.reminder-test-store.json
 waifu-prefs.json
 
 
