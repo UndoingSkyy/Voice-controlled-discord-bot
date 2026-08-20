@@ -588,8 +588,49 @@ const DESTRUCTIVE_PERMISSION = {
 };
 
 const CONFIRM_TTL_MS = Number(process.env.MOD_CONFIRM_TTL_SEC ?? 120) * 1000;
+/**
+ * Floor between asking and accepting. Matching the request is deliberately
+ * forgiving now, which also makes it easy for the model to "confirm" its own
+ * question by calling the tool twice in one breath. A real person has to hear
+ * the question and answer it, which never happens this fast.
+ */
+const CONFIRM_MIN_MS = Number(process.env.MOD_CONFIRM_MIN_MS ?? 1200);
 const CONFIRM_ENABLED = process.env.MOD_CONFIRM_DESTRUCTIVE !== '0';
 const pendingConfirm = new Map(); // signature -> requested at
+
+/**
+ * Identity of a pending destructive request.
+ *
+ * This has to survive the model rewriting its own arguments between the ask and
+ * the answer, which it does constantly: it reorders keys, adds a `reason` it
+ * just made up, sends "5" where it sent 5, or recapitalises a name. Comparing
+ * raw JSON treats each of those as a brand-new request, so the confirmation is
+ * asked again and the conversation never gets past it.
+ *
+ * So compare on what actually determines the outcome: the tool, the guild, the
+ * person asking, and the arguments normalised — sorted, trimmed, case-folded,
+ * with free-text fields that do not change what happens left out entirely.
+ */
+const COSMETIC_ARGS = new Set(['reason', 'message', 'description']);
+
+function confirmKey(name, args, ctx) {
+  const parts = Object.entries(args ?? {})
+    .filter(([k, v]) => !COSMETIC_ARGS.has(k) && v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => {
+      let value = v;
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        // "5" and 5, "true" and true all mean the same thing to the handler.
+        if (trimmed !== '' && Number.isFinite(Number(trimmed))) value = Number(trimmed);
+        else if (/^(true|false)$/i.test(trimmed)) value = trimmed.toLowerCase() === 'true';
+        else value = trimmed.toLowerCase();
+      }
+      return `${k}=${JSON.stringify(value)}`;
+    })
+    .sort();
+
+  return `${ctx.guild?.id}:${ctx.requester?.id}:${name}:${parts.join('&')}`;
+}
 
 function confirmationGate(name, args, ctx) {
   if (!CONFIRM_ENABLED) return null;
@@ -599,10 +640,11 @@ function confirmationGate(name, args, ctx) {
   const what = describe(args ?? {});
   if (!what) return null; // e.g. clearing a timeout, which is not destructive
 
-  const key = `${ctx.guild?.id}:${ctx.requester?.id}:${name}:${JSON.stringify(args ?? {})}`;
+  const key = confirmKey(name, args, ctx);
   const requestedAt = pendingConfirm.get(key);
+  const waited = requestedAt ? Date.now() - requestedAt : 0;
 
-  if (requestedAt && Date.now() - requestedAt <= CONFIRM_TTL_MS) {
+  if (requestedAt && waited >= CONFIRM_MIN_MS && waited <= CONFIRM_TTL_MS) {
     pendingConfirm.delete(key); // agreed to — let it through
     return null;
   }
@@ -611,16 +653,23 @@ function confirmationGate(name, args, ctx) {
   for (const [k, at] of pendingConfirm) {
     if (Date.now() - at > CONFIRM_TTL_MS) pendingConfirm.delete(k);
   }
-  pendingConfirm.set(key, Date.now());
 
+  // Keep the original timestamp. Re-asking must not restart the clock, or a
+  // model that calls twice in quick succession could never mature the request.
+  if (!requestedAt) pendingConfirm.set(key, Date.now());
+
+  const tooSoon = requestedAt && waited < CONFIRM_MIN_MS;
   return {
     needs_confirmation: true,
     about_to: what,
-    instruction:
-      `NOTHING HAS HAPPENED YET. Ask out loud whether to ${what}, then stop and wait. ` +
-      'If they agree, call this tool again with exactly the same arguments and it will ' +
-      'go ahead. If they decline or change the number, do not call it again with these ' +
-      'arguments.',
+    instruction: tooSoon
+      ? `STILL NOTHING HAS HAPPENED. You have not yet heard an answer about whether to ` +
+        `${what}. Say the question out loud and wait for a human reply before calling ` +
+        'this again. Do not answer it yourself.'
+      : `NOTHING HAS HAPPENED YET. Ask out loud whether to ${what}, then stop and wait. ` +
+        'If they agree, call this tool again with the same arguments and it will go ' +
+        'ahead. If they decline or change the number, do not call it again with these ' +
+        'arguments.',
   };
 }
 
